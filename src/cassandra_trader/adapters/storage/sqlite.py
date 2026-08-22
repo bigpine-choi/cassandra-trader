@@ -344,6 +344,46 @@ class SqliteMinuteCandleRepository:
 
         return tuple(_stored_candle(row) for row in rows)
 
+    def list_minute_candles_as_of(
+        self,
+        market: str,
+        start_time_utc: datetime,
+        end_time_utc: datetime,
+        as_of: datetime,
+    ) -> tuple[StoredMinuteCandle, ...]:
+        """Return the highest available revision per minute in a UTC range."""
+
+        start_text = _utc_text(start_time_utc)
+        end_text = _utc_text(end_time_utc)
+        as_of_text = _utc_text(as_of)
+
+        if start_time_utc >= end_time_utc:
+            raise ValueError("start_time_utc must be before end_time_utc")
+
+        rows = self._connection.execute(
+            """
+            WITH available_revisions AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY market, start_time_utc
+                           ORDER BY revision DESC
+                       ) AS revision_rank
+                FROM canonical_minute_candles
+                WHERE market = ?
+                  AND start_time_utc >= ?
+                  AND start_time_utc < ?
+                  AND available_at <= ?
+            )
+            SELECT *
+            FROM available_revisions
+            WHERE revision_rank = 1
+            ORDER BY start_time_utc
+            """,
+            (market, start_text, end_text, as_of_text),
+        ).fetchall()
+
+        return tuple(_stored_candle(row) for row in rows)
+
     def _migrate(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
 

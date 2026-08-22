@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -91,6 +92,27 @@ def _ingest(
 def _count(database: Path, table: str) -> int:
     with sqlite3.connect(database) as connection:
         return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def _record_for_candle(candle: MinuteCandle, response_order: int) -> RawMinuteCandleInput:
+    source_time = candle.start_time_utc.isoformat().replace("+00:00", "Z")
+
+    return RawMinuteCandleInput(
+        response_order=response_order,
+        market=candle.market,
+        source_candle_time=source_time,
+        raw_payload={
+            "market": candle.market,
+            "candle_date_time_utc": source_time.removesuffix("Z"),
+            "opening_price": str(candle.open),
+            "high_price": str(candle.high),
+            "low_price": str(candle.low),
+            "trade_price": str(candle.close),
+            "candle_acc_trade_volume": str(candle.base_volume),
+            "candle_acc_trade_price": str(candle.quote_volume),
+        },
+        candle=candle,
+    )
 
 
 def test_stores_first_raw_and_canonical_batch(tmp_path: Path) -> None:
@@ -289,3 +311,75 @@ def test_batch_rolls_back_on_mid_transaction_error(tmp_path: Path) -> None:
     assert _count(database, "raw_ingestion_batches") == 0
     assert _count(database, "raw_minute_candles") == 0
     assert _count(database, "canonical_minute_candles") == 0
+
+
+def test_as_of_range_query_excludes_future_revision_and_selects_latest(tmp_path: Path) -> None:
+    database = tmp_path / "cassandra.db"
+    first = _candle(close="105")
+    revised = _candle(close="106")
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(
+            repository,
+            batch_id="batch-1",
+            records=(_record_for_candle(first, 0),),
+            received_at=_RECEIVED,
+            ingested_at=_RECEIVED + timedelta(seconds=1),
+        )
+        _ingest(
+            repository,
+            batch_id="batch-2",
+            records=(_record_for_candle(revised, 0),),
+            received_at=_RECEIVED + timedelta(minutes=1),
+            ingested_at=_RECEIVED + timedelta(minutes=1, seconds=1),
+        )
+        before_revision = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            _RECEIVED + timedelta(seconds=30),
+        )
+        after_revision = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            _RECEIVED + timedelta(minutes=2),
+        )
+
+    assert len(before_revision) == 1
+    assert before_revision[0].revision == 1
+    assert before_revision[0].candle.close == Decimal("105")
+    assert len(after_revision) == 1
+    assert after_revision[0].revision == 2
+    assert after_revision[0].candle.close == Decimal("106")
+
+
+def test_as_of_range_query_returns_minutes_in_start_order(tmp_path: Path) -> None:
+    database = tmp_path / "cassandra.db"
+    starts = (
+        _START + timedelta(minutes=2),
+        _START,
+        _START + timedelta(minutes=1),
+    )
+    records = tuple(
+        _record_for_candle(
+            replace(
+                _candle(),
+                start_time_utc=start,
+                end_time_utc=start + timedelta(minutes=1),
+            ),
+            response_order,
+        )
+        for response_order, start in enumerate(starts)
+    )
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(repository, batch_id="batch-1", records=records)
+        stored = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=3),
+            _RECEIVED + timedelta(seconds=2),
+        )
+
+    assert [item.candle.start_time_utc for item in stored] == sorted(starts)
