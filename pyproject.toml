@@ -7,7 +7,9 @@ authors = [
     { name = "Hansol Choi", email = "198446733+bigpine-choi@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "upbit-sdk>=0.9.0",
+]
 
 [project.scripts]
 cassandra-trader = "cassandra_trader.cli:main"
