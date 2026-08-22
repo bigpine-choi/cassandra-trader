@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -5,6 +6,10 @@ from pathlib import Path
 import pytest
 
 from cassandra_trader.adapters.storage.sqlite import IngestionStats
+from cassandra_trader.adapters.upbit.public_stream import (
+    LifecycleStatus,
+    StreamLifecycleEvent,
+)
 from cassandra_trader.apps.minute_candle_backfill import MinuteCandleBackfillResult
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
@@ -15,6 +20,7 @@ from cassandra_trader.domain.four_hour_bar import (
     FourHourCandle,
 )
 from cassandra_trader.domain.market import TradingPair
+from cassandra_trader.domain.public_stream import StreamType, TickerEvent
 
 
 def test_main(capsys: pytest.CaptureFixture[str]) -> None:
@@ -411,3 +417,107 @@ def test_four_hour_bar_rejects_invalid_utc_arguments(
                 str(tmp_path / "cassandra.db"),
             ]
         )
+
+
+def test_stream_public_outputs_json_lines_and_lifecycle_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed = False
+    event = TickerEvent(
+        market="KRW-BTC",
+        trade_price=Decimal("105307000.123456789"),
+        signed_change_rate=Decimal("-0.0012"),
+        acc_trade_price_24h=Decimal("123456789.987654321"),
+        trade_timestamp_utc=datetime(2026, 8, 22, 16, 59, 59, 123000, tzinfo=UTC),
+        received_at=datetime(2026, 8, 22, 17, 0, tzinfo=UTC),
+        stream_type=StreamType.REALTIME,
+    )
+
+    async def fake_stream_public_events(markets, *, lifecycle_callback):
+        nonlocal closed
+        assert markets == ["KRW-BTC", "KRW-ETH"]
+        lifecycle_callback(
+            StreamLifecycleEvent(
+                status=LifecycleStatus.CONNECTED,
+                attempt=0,
+            )
+        )
+
+        try:
+            yield event
+            yield event
+        finally:
+            closed = True
+            lifecycle_callback(
+                StreamLifecycleEvent(
+                    status=LifecycleStatus.DISCONNECTED,
+                    attempt=0,
+                )
+            )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.stream_public_events",
+        fake_stream_public_events,
+    )
+
+    exit_code = main(
+        [
+            "stream-public",
+            "krw-btc",
+            "KRW-ETH",
+            "--max-events",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    lifecycle = [json.loads(line) for line in captured.err.splitlines()]
+
+    assert exit_code == 0
+    assert output == {
+        "event_type": "ticker",
+        "market": "KRW-BTC",
+        "trade_price": "105307000.123456789",
+        "signed_change_rate": "-0.0012",
+        "acc_trade_price_24h": "123456789.987654321",
+        "trade_timestamp_utc": "2026-08-22T16:59:59.123000Z",
+        "received_at": "2026-08-22T17:00:00Z",
+        "stream_type": "REALTIME",
+    }
+    assert lifecycle == [
+        {"lifecycle": "CONNECTED", "attempt": 0},
+        {"lifecycle": "DISCONNECTED", "attempt": 0},
+    ]
+    assert closed is True
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["stream-public"],
+        ["stream-public", "BTC"],
+        ["stream-public", "KRW-BTC", "--max-events", "0"],
+    ],
+)
+def test_stream_public_rejects_invalid_arguments(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(arguments)
+
+
+def test_stream_public_handles_keyboard_interrupt_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def interrupt(coroutine):
+        coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("cassandra_trader.cli.asyncio.run", interrupt)
+
+    exit_code = main(["stream-public", "KRW-BTC"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Traceback" not in captured.err
