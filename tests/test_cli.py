@@ -1,8 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from cassandra_trader.adapters.storage.sqlite import IngestionStats
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.market import TradingPair
@@ -101,3 +103,52 @@ def test_candles_command(
 def test_candles_command_rejects_invalid_arguments(arguments: list[str]) -> None:
     with pytest.raises(SystemExit):
         main(arguments)
+
+
+def test_sync_candles_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "nested" / "cassandra.db"
+
+    async def fake_sync_recent_minute_candles(
+        market: str,
+        count: int,
+        database_path: str | Path,
+    ) -> IngestionStats:
+        assert market == "KRW-BTC"
+        assert count == 5
+        assert database_path == database
+        return IngestionStats(
+            raw_count=5,
+            new_canonical_count=3,
+            revised_canonical_count=1,
+            unchanged_canonical_count=1,
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.sync_recent_minute_candles",
+        fake_sync_recent_minute_candles,
+    )
+
+    main(
+        [
+            "sync-candles",
+            "KRW-BTC",
+            "--count",
+            "5",
+            "--database",
+            str(database),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert captured.out == (
+        "raw_received=5\n"
+        "canonical_new=3\n"
+        "canonical_revised=1\n"
+        "canonical_unchanged=1\n"
+        f"database={database.resolve()}\n"
+    )

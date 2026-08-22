@@ -1,8 +1,10 @@
 """Read-only adapter for Upbit public market data."""
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from upbit.types import CandleListMinutesResponse, TradingPairListResponse
 
@@ -11,6 +13,27 @@ from cassandra_trader.domain.market import TradingPair
 
 type ListTradingPairs = Callable[..., Awaitable[TradingPairListResponse]]
 type ListMinuteCandles = Callable[..., Awaitable[CandleListMinutesResponse]]
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteCandleObservation:
+    """One raw Upbit response item and its completed canonical candle, if any."""
+
+    response_order: int
+    market: str
+    source_candle_time: str
+    raw_payload: dict[str, object]
+    candle: MinuteCandle | None
+
+
+@dataclass(frozen=True, slots=True)
+class MinuteCandleResponseBatch:
+    """One recorded Upbit minute-candle REST response."""
+
+    endpoint: str
+    request_parameters: dict[str, str | int]
+    received_at: datetime
+    observations: tuple[MinuteCandleObservation, ...]
 
 
 class UpbitPublicDataAdapter:
@@ -66,11 +89,33 @@ class UpbitPublicDataAdapter:
     ) -> tuple[MinuteCandle, ...]:
         """Return recent completed one-minute candles in chronological order."""
 
-        normalized_market = market.strip().upper()
-        quote, separator, base = normalized_market.partition("-")
+        batch = await self.fetch_minute_candle_batch(
+            market,
+            count,
+            as_of=as_of,
+        )
 
-        if not separator or not quote.isalnum() or not base.isalnum():
-            raise ValueError(f"Invalid market code: {market}")
+        unique: dict[tuple[str, datetime], MinuteCandle] = {}
+
+        for observation in batch.observations:
+            if observation.candle is not None:
+                candle = observation.candle
+                unique.setdefault((candle.market, candle.start_time_utc), candle)
+
+        ordered = sorted(unique.values(), key=lambda candle: candle.start_time_utc)
+
+        return tuple(ordered[-count:])
+
+    async def fetch_minute_candle_batch(
+        self,
+        market: str,
+        count: int = 1,
+        *,
+        as_of: datetime | None = None,
+    ) -> MinuteCandleResponseBatch:
+        """Fetch raw response fields alongside completed canonical candles."""
+
+        normalized_market = _normalize_market(market)
 
         if not 1 <= count <= 200:
             raise ValueError("count must be between 1 and 200")
@@ -85,18 +130,22 @@ class UpbitPublicDataAdapter:
 
         observed_at = observed_at.astimezone(UTC)
         complete_before = observed_at.replace(second=0, microsecond=0)
+        request_parameters: dict[str, str | int] = {
+            "market": normalized_market,
+            "count": count,
+            "to": complete_before.isoformat().replace("+00:00", "Z"),
+        }
         raw_candles = await self._list_minute_candles(
             1,
-            market=normalized_market,
-            count=count,
-            to=complete_before.isoformat().replace("+00:00", "Z"),
+            **request_parameters,
         )
+        received_at = datetime.now(UTC)
+        observations: list[MinuteCandleObservation] = []
 
-        unique: dict[tuple[str, datetime], MinuteCandle] = {}
-
-        for raw in raw_candles:
-            start_time = _parse_upbit_utc(raw.candle_date_time_utc)
-            candle = MinuteCandle(
+        for response_order, raw in enumerate(raw_candles):
+            source_candle_time = raw.candle_date_time_utc
+            start_time = _parse_upbit_utc(source_candle_time)
+            mapped = MinuteCandle(
                 market=raw.market,
                 start_time_utc=start_time,
                 end_time_utc=start_time + timedelta(minutes=1),
@@ -107,13 +156,32 @@ class UpbitPublicDataAdapter:
                 base_volume=Decimal(raw.candle_acc_trade_volume),
                 quote_volume=Decimal(raw.candle_acc_trade_price),
             )
+            observations.append(
+                MinuteCandleObservation(
+                    response_order=response_order,
+                    market=raw.market,
+                    source_candle_time=start_time.isoformat().replace("+00:00", "Z"),
+                    raw_payload=_sdk_model_payload(raw),
+                    candle=mapped if mapped.end_time_utc <= observed_at else None,
+                )
+            )
 
-            if candle.end_time_utc <= observed_at:
-                unique.setdefault((candle.market, candle.start_time_utc), candle)
+        return MinuteCandleResponseBatch(
+            endpoint="/v1/candles/minutes/1",
+            request_parameters=request_parameters,
+            received_at=received_at,
+            observations=tuple(observations),
+        )
 
-        ordered = sorted(unique.values(), key=lambda candle: candle.start_time_utc)
 
-        return tuple(ordered[-count:])
+def _normalize_market(market: str) -> str:
+    normalized_market = market.strip().upper()
+    quote, separator, base = normalized_market.partition("-")
+
+    if not separator or not quote.isalnum() or not base.isalnum():
+        raise ValueError(f"Invalid market code: {market}")
+
+    return normalized_market
 
 
 def _parse_upbit_utc(value: str) -> datetime:
@@ -123,3 +191,12 @@ def _parse_upbit_utc(value: str) -> datetime:
         return parsed.replace(tzinfo=UTC)
 
     return parsed.astimezone(UTC)
+
+
+def _sdk_model_payload(model: Any) -> dict[str, object]:
+    model_dump = getattr(model, "model_dump", None)
+
+    if callable(model_dump):
+        return dict(model_dump(mode="json"))
+
+    return dict(vars(model))

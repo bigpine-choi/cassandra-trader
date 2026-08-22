@@ -3,9 +3,13 @@
 import argparse
 import asyncio
 from collections.abc import Sequence
+from pathlib import Path
 
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
-from cassandra_trader.apps.minute_candles import fetch_recent_minute_candles
+from cassandra_trader.apps.minute_candles import (
+    fetch_recent_minute_candles,
+    sync_recent_minute_candles,
+)
 
 
 def _positive_integer(value: str) -> int:
@@ -67,6 +71,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="number of completed candles to display (1-200)",
     )
 
+    sync_candles = commands.add_parser(
+        "sync-candles",
+        help="store one raw and canonical Upbit minute-candle batch",
+    )
+    sync_candles.add_argument(
+        "market",
+        type=_market_code,
+        help="Upbit market code, such as KRW-BTC",
+    )
+    sync_candles.add_argument(
+        "--count",
+        type=_candle_count,
+        default=5,
+        help="number of completed candles to request (1-200)",
+    )
+    sync_candles.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
     return parser
 
 
@@ -94,6 +120,16 @@ async def _print_candles(market: str, count: int) -> None:
         )
 
 
+async def _sync_candles(market: str, count: int, database: Path) -> None:
+    result = await sync_recent_minute_candles(market, count, database)
+
+    print(f"raw_received={result.raw_count}")
+    print(f"canonical_new={result.new_canonical_count}")
+    print(f"canonical_revised={result.revised_canonical_count}")
+    print(f"canonical_unchanged={result.unchanged_canonical_count}")
+    print(f"database={database.resolve()}")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the Cassandra Trader command-line interface."""
 
@@ -109,3 +145,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if arguments.command == "candles":
         asyncio.run(_print_candles(arguments.market, arguments.count))
+
+    if arguments.command == "sync-candles":
+        asyncio.run(_sync_candles(arguments.market, arguments.count, arguments.database))
