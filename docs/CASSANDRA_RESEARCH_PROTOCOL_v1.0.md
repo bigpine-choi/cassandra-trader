@@ -89,7 +89,7 @@ Blueprint에 따라 7일을 주 예측 수평선으로 두되 1일·3일·14일 
 | H-RANK | PIT 정보로 미래 초과수익의 교차단면 순위를 예측할 수 있다. | 전역 시간축 rolling-origin에서 양의 Rank IC 분포, 기준선 대비 증분, lockbox 재현 | 사전 지정 집계 Rank IC의 block-bootstrap 신뢰구간 상단이 0 이하이면 방향 가설을 반증한다. 0을 걸치면 미결정이며 채택 근거가 아니다. |
 | H-PROB | 양의 초과수익 확률을 단순 발생률보다 유용하게 추정할 수 있다. | 발생률/단순모델 대비 proper-score skill과 OOS calibration | baseline 대비 score 개선의 신뢰구간 상단이 0 이하이거나 calibration이 사전 기준을 충족하지 못하면 반증 또는 채택 실패다. calibration 기준은 `TBD-R03`이다. |
 | H-DOWN | 하방위험 모델이 단순 역사·EWMA 기준보다 미래 꼬리손실을 잘 구분한다. | exceedance calibration, tail ranking, 레짐·유동성별 안정성 | 기준선 대비 하방위험 skill의 신뢰구간 상단이 0 이하이거나 위험을 지속적으로 과소 추정하면 반증 또는 위험모델 채택 실패다. |
-| H-NET | 예측을 Long/Cash 포트폴리오로 변환하면 현실적 비용 후에도 사전 지정한 가장 강한 적격 기준선보다 경제적 증분이 있다. | 모든 현금 비용과 simulated/executed 노출 경로를 반영한 chronological OOS, outer-fold Net Calmar 중앙값의 paired 차이, 순수익 경제효과와 lockbox 비교 | paired Net Calmar 차이의 신뢰구간 상단이 0 이하이면 방향 가설을 반증한다. 하단이 `TBD-V08`의 경제효과를 넘지 못하거나 성과가 거래 불가능·비유동 종목, 미래정보 또는 비용 누락에 의존하면 채택에 실패한다. |
+| H-NET | 예측을 Long/Cash 포트폴리오로 변환하면 현실적 비용 후에도 사전 지정한 Calmar 적격 위험 기준선보다 경제적 증분이 있고 cash 절대 hurdle을 넘는다. | 모든 현금 비용과 simulated/executed 노출 경로를 반영한 chronological OOS, outer-fold Net Calmar 중앙값의 paired 차이, cash 대비 순수익 경제효과와 lockbox 비교 | paired Net Calmar 차이의 신뢰구간 상단이 0 이하이면 방향 가설을 반증한다. cash hurdle 또는 `TBD-V08`의 경제효과를 넘지 못하거나 성과가 거래 불가능·비유동 종목, 미래정보 또는 비용 누락에 의존하면 채택에 실패한다. |
 | H-ROBUST | 관측된 효과가 한 fold·레짐·유동성 꼬리·소수 종목에만 의존하지 않는다. | fold·레짐·유동성·상장연령 하위표본과 영향도 분석 | 사전 정의한 안정성 조건을 통과하지 못하면 전체 평균이 양수여도 승격하지 않는다. 안정성 조건은 `TBD-V09`다. |
 
 proper-score skill은 `baseline loss - candidate loss`로 정의해 클수록 좋게 맞춘다. 하방위험의
@@ -122,28 +122,45 @@ proper-score skill은 `baseline loss - candidate loss`로 정의해 클수록 �
 | 필드 | 정의 | 금지되는 대체 |
 |---|---|---|
 | `event_time` | 거래, 호가, 봉 구성 이벤트 또는 시장상태가 실제로 발생한 거래소 시각 | 수신시각으로 덮어쓰기 |
-| `received_at` | Cassandra가 해당 원응답 또는 revision을 처음 수신한 시각 | 재처리 시각으로 덮어쓰기 |
-| `available_at` | 그 revision이 검증 경로에서 처음 이용 가능해진 실제 시각. Blueprint의 `available_time`과 같은 개념이다. | `event_time` 또는 과거 봉 마감시각을 이용해 소급 생성 |
+| `source_available_at` | 출처가 레코드나 revision을 공개한 것으로 직접 관측·입증되는 시각 | 수신·적재시각 또는 추정값으로 대체 |
+| `received_at` | Cassandra 수집기가 해당 원응답 또는 revision을 처음 수신한 시각 | `source_available_at` 또는 재처리 시각으로 덮어쓰기 |
+| `ingested_at` | 원응답이 append-only 저장소에 영속화된 시각 | `received_at`으로 대체 |
+| `available_at` | live-captured 데이터가 Cassandra 검증 경로에서 실제로 이용 가능해진 시각. Blueprint의 `available_time`과 같은 개념이다. | `event_time` 또는 모델 추정시각을 실제값처럼 기록 |
+| `modeled_available_at` | reconstructed PIT에 versioned availability model과 보수적 지연을 적용한 의사결정 가능시각 | actual PIT의 `available_at`으로 가장 |
+| `provenance` | 출처·endpoint·요청/연결·snapshot·수집 방식과 availability 근거 | 출처 없는 최종값만 보존 |
 | `bar_end` | canonical 1분봉·4시간봉의 논리적 UTC 구간 종료시각 | 실제 가용·결정시각으로 간주 |
 | `as_of` | 한 의사결정에서 특징·유니버스·예측이 볼 수 있는 정보의 공통 cutoff | 실행 시각의 최신 final 데이터로 과거를 재구성 |
 | `decision_at` | 해당 `as_of` snapshot의 품질 확인 뒤 모델·포트폴리오 계산을 시작한 실제 시각 | `bar_end`로 소급 기록 |
 | `revision` | 같은 논리 레코드의 단조 증가 버전과 변경 사유 | 기존 값을 제자리 덮어쓰기 |
 | `label_start`·`label_end` | 실행 가능한 label 가격구간의 시작·종료시각 | 단순 행 수 또는 봉 개수로 대체 |
-| `label_available_at` | label 결과가 학습에 처음 이용 가능해진 실제 시각 | `label_end`와 항상 같다고 가정 |
+| `label_available_at` | actual PIT label 결과가 학습에 처음 이용 가능해진 실제 시각 | `label_end`와 항상 같다고 가정 |
+| `modeled_label_available_at` | reconstructed PIT label에 availability model과 계산 지연을 적용한 학습 가능시각 | actual `label_available_at`으로 가장 |
 
-원천, 요청/연결 ID, 스키마 버전, 품질 상태, raw hash도 함께 보존한다. 특징에는 실제
-lookback의 `feature_dependency_start`와 lineage를 둔다. 특징·유니버스·모델 입력은
-`input.available_at <= as_of <= decision_at`을 만족해야 한다. 학습 label은
-`label_available_at <= training_cutoff`일 때만 사용할 수 있다. 봉이 늦게 final되면
-`decision_at`을 늦추거나 해당 정상 결정을 건너뛰며 `bar_end`로 시간을 되돌리지 않는다.
+원천, 요청/연결 ID, 스키마 버전, 품질 상태와 raw hash도 함께 보존한다. 특징에는 실제
+lookback의 `feature_dependency_start`와 lineage를 둔다. actual PIT 입력은
+`input.available_at <= as_of`, reconstructed PIT 입력은
+`input.modeled_available_at <= as_of`를 만족해야 하며 둘 다 `as_of <= decision_at`이어야 한다.
+actual PIT 학습 label은 `label_available_at <= training_cutoff`, reconstructed PIT 학습
+label은 `modeled_label_available_at <= training_cutoff`일 때만 사용할 수 있다. 봉이 늦게
+final되면 `decision_at`을 늦추거나 해당 정상 결정을 건너뛰며 `bar_end`로 시간을 되돌리지
+않는다.
 
-과거 REST backfill을 오늘 수신했다면 `received_at`과 관측된 `available_at`은 오늘이다.
-정확한 과거 배포 지연을 알 수 없는데도 과거 봉 마감시각에 이미 이용 가능했다고 기록하지
-않는다. 가격 자체의 역사 연구와 실시간 가용성·지연 연구를 분리하고, 알 수 없는 과거
-가용성은 `UNKNOWN`으로 남겨 보수적 의사결정 지연 또는 live-captured 표본으로 보완한다.
-해당 `received_at`보다 이른 pseudo-live 의사결정 증거로 backfill을 사용할 수 없다. 별도의
-역사가격 연구에 쓰면 `non-PIT/backfill assumption`을 표시하고 승격 증거와 분리한다. 정확한
-정책은 `TBD-D04`로 고정한다.
+역사 데이터 증거 등급은 다음과 같이 고정한다.
+
+| 등급 | 허용 용도 | 제한 |
+|---|---|---|
+| **actual PIT live-captured** | 예측·백테스트·shadow 검증과 실제 latency·revision·TCA 추정 | 실제 `received_at`, `ingested_at`, `available_at`과 provenance를 보존한다. `source_available_at`은 출처가 제공할 때 실제값으로, 없으면 `UNAVAILABLE`로 기록한다. |
+| **reconstructed PIT** | explicit availability model과 보수적 지연을 적용한 역사 OHLCV 백테스트 | model version·가정·`modeled_available_at`·`modeled_label_available_at`을 기록한다. source value의 불변성을 검증하거나 당시 revision을 재구성할 수 있어야 하며, 과거 latency·revision·TCA의 실측 증거로 사용하지 않는다. |
+| **non-PIT exploratory** | 특징·가설 탐색과 데이터 가능성 조사 | confirmatory OOS, lockbox 또는 승격 증거로 사용하지 않는다. |
+
+과거 REST backfill을 오늘 수신했다면 `received_at`과 `ingested_at`은 오늘이며 이를 과거 시각으로
+소급하지 않는다. 출처의 과거 공개시각을 직접 입증할 수 없으면 actual
+`source_available_at`을 채우지 않는다. 다만 versioned explicit availability model과 보수적
+지연을 적용한 역사 OHLCV는 reconstructed PIT로 백테스트에 사용할 수 있다. 과거 latency,
+revision 도착분포와 TCA에 관한 주장은 actual PIT live-captured 자료로 제한한다. 구체적인
+availability model과 민감도는 `TBD-D04`로 고정한다. 보수적 지연만으로 revision PIT가
+확보되는 것은 아니다. 불변성 또는 당시 revision을 입증하지 못한 값과 그 파생물은
+non-PIT exploratory로 강등한다.
 
 ### 3.2 revision 생명주기
 
@@ -187,22 +204,32 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
 ### 3.5 point-in-time 유니버스
 
 각 종목에 대해 상장, 상장폐지, 거래 유의, 거래정지, 재개와 시장 코드 변경을 효력시각과
-실제 `available_at`이 있는 이벤트로 저장한다. 각 4시간 `as_of`의 적격 유니버스는 그때까지
-알려진 상태와 거래대금·유동성만으로 재구성한다.
+증거 등급에 맞는 `available_at` 또는 `modeled_available_at`이 있는 이벤트로 저장한다.
+유니버스는 일 1회 PIT snapshot으로 갱신하고, 각 4시간 `as_of`는 그때 유효한 최신 snapshot만
+사용한다. snapshot은 그때까지 알려진 상태와 거래대금·유동성만으로 재구성한다.
 
+- v1 기준선은 최근 30일 거래대금 상위 약 30개 적격 KRW 종목이며, 상장 후 90일 미만 종목은
+  제외한다.
 - 최종 생존 종목 목록으로 과거를 필터링하지 않는다.
 - 상장폐지·유의·정지 종목과 실패한 데이터 구간을 역사에서 제거하지 않는다.
 - Blueprint 정책에 따라 스테이블코인은 거래 유니버스에서 제외하고, BTC·ETH 상태는 거래대상
-  편입 여부와 무관하게 레짐 입력 후보에 포함한다.
+  편입 여부와 무관하게 레짐 입력에 항상 포함한다.
 - 오늘 수정된 종목 메타데이터를 과거 snapshot에 소급 적용하지 않는다.
 - cross-coin, breadth, BTC/ETH 상태도 같은 `as_of` 유니버스와 revision만 사용한다.
 - 외부 지수나 데이터가 당시 이용 가능했음을 입증할 수 없으면 학습 입력이 아니라 사후
   진단으로만 사용한다.
 
+30일 lookback, 약 30종목 목표 규모와 상장 90일 기준은 성과를 보고 바꾸지 않는다. 약 30개는
+튜닝 가능한 모델 파라미터가 아니며, 실제 구성과 종목 수는 사전 동결한 진입·퇴출 buffer,
+동률, 결측·불완전 데이터 규칙으로 결정론적으로 정한다. 이 규칙과 기준선 주변 민감도만
+`TBD-U01`로 정한다. 적격 종목이 부족하면 유니버스를 억지로 채우지 않는다.
+
 ### 3.6 재현성 데이터 manifest
 
 모든 연구 실행은 raw/canonical/derived snapshot ID, 스키마 버전, 시각 범위, row count,
-품질 상태별 count, source hash, revision cutoff, PIT 유니버스 hash를 manifest로 남긴다.
+품질 상태별 count, source hash, revision cutoff, PIT 유니버스 hash, 증거 등급, provenance와
+availability model version을 manifest로 남긴다.
+파생 artifact와 연구 결과는 구성 입력 가운데 가장 약한 증거 등급을 상속한다.
 동일 manifest와 코드·설정으로 canonical 1분봉, 완결 4시간봉, 특징과 label을 다시 만들었을
 때 bitwise 또는 사전 정의한 수치 허용오차 안에서 동일해야 한다.
 
@@ -245,23 +272,26 @@ multiple-testing 부담도 함께 늘어난다.
 | 시장 기준선 | PIT 내부 시장 프록시 | 시장 베타와 종목선택의 기여를 분리한다. 정확한 프록시는 `TBD-R01`이다. |
 | 포트폴리오 기준선 | PIT liquid universe 동일가중 | 복잡한 점수·최적화 없이 투자 가능한 대안과 비교한다. |
 | 신호 기준선 | 단순 다중기간/7일 모멘텀 | 알려진 단순 신호 대비 복잡도의 증분을 측정한다. |
-| 선형 모델 | Ridge, Lasso, 필요 시 Elastic Net | 해석 가능하고 규제가 강한 기준 후보 |
-| 트리 모델 | LightGBM, XGBoost | 비선형·상호작용 후보. 동일한 비용·trial budget 아래 선형 모델과 경쟁한다. |
+| 지정 v1 Alpha Champion | Elastic Net + LightGBM/LambdaRank | Blueprint가 확정한 v1 구성. 본 Protocol의 증거 기준을 통과해야만 승격할 수 있다. |
+| 선형 비교군 | Ridge, Lasso | 해석 가능하고 규제가 강한 기준 후보 |
+| 트리 Challenger | XGBoost | 비선형·상호작용 대안. 동일한 비용·trial budget 아래 평가한다. |
 | 딥러닝 Challenger | TimesNet, TimeMixer, iTransformer | 일반 시계열 아키텍처의 이전 가능성을 시험하는 후보. 사전 Champion이 아니다. |
 | 후속 Challenger | time-series foundation model, 온라인 적응 모델 | 데이터·연산·재현성·drift 계약이 준비된 뒤에만 평가한다. |
 
-Blueprint가 Elastic Net·LightGBM을 v1 알파 Champion 구성으로 계획했더라도 실제 운영
-Champion 승격은 본 Protocol의 증거를 통과해야 한다. 검증 중 incumbent는 가장 단순한
-기준선일 수 있다. TimesNet을 포함한 Challenger를 이름이나 다른 데이터셋의 논문 성능만으로
-Champion으로 사전 지정하지 않는다.
+Blueprint가 확정한 v1 Alpha Champion과 Challenger의 권한을 본 Protocol이 바꾸지 않는다.
+지정 v1 Champion이 증거 기준을 통과하지 못하면 다른 모델을 대신 승격하지 않고 **v1 승격
+실패**로 기록한다. 다른 모델을 Champion으로 교체하려면 먼저 Blueprint 또는 ADR을 변경해야
+한다. Challenger는 비교·shadow 평가 대상이며 이름이나 다른 데이터셋의 논문 성능만으로
+Champion 권한을 얻지 않는다. 같은 권한 규칙은 Blueprint의 해석 가능한 연속 점수 기반 v1
+Regime Champion에도 적용한다.
 
 ### 5.2 공정한 경쟁 조건
 
 - 모든 후보는 같은 data manifest, PIT universe, development outer folds, label과 비용
   시나리오를 사용한다.
-- 마지막 lockbox에는 development outer에서 선택·동결한 단 하나의 최종 pipeline과 사전 지정
-  baseline만 넣는다. 여러 후보를 불가피하게 평가하면 동시추론을 적용하고 그 결과로 추가
-  선택하지 않는다.
+- v1 승격용 마지막 lockbox에는 development outer에서 지정 v1 Champion 구성 안에서
+  선택·동결한 단 하나의 최종 pipeline과 사전 지정 baseline만 넣는다. Challenger 평가는
+  별도 사전 등록하고, 그 결과로 v1 Champion을 대체하거나 추가 선택하지 않는다.
 - 전처리, 특징 선택, 하이퍼파라미터, ensemble, calibration은 inner loop에서만 선택한다.
 - 모델별 탐색공간, random seed 수, wall-clock/연산 예산과 총 시행 수를 사전 등록한다.
 - 예측 정확도와 비용 차감 포트폴리오 성과를 모두 보고하며, 한쪽만 골라 발표하지 않는다.
@@ -293,7 +323,8 @@ validation/test에 있는 분할도 금지한다. breadth와 cross-coin 특징 �
 expanding/rolling training window, 최소 학습 길이, OOS 길이와 step은 `TBD-V01`로 첫 outer
 결과 열람 전에 고정한다. outer OOS 구간은 원칙적으로 겹치지 않게 구성한다. 겹침이 필요한
 경우 각 `as_of`에 평가할 단 하나의 frozen-origin 예측과 가중 규칙을 미리 정해 동일 시점을
-두 번 집계하지 않는다.
+두 번 집계하지 않는다. primary wealth path의 OOS `as_of`는 첫 평가 이후 끊김 없이 이어져야
+하며, 비연속 OOS 설계는 primary Net Calmar 증거로 사용하지 않는다.
 
 각 outer fold에서는 다음 순서를 지킨다.
 
@@ -335,13 +366,19 @@ embargo는 purge와 구분하며, 비시간순 조합 분할에서 미래측 tra
 - CPCV와 CSCV는 같은 방법이 아니다. CSCV 자체를 label purging 기법이라고 부르지 않는다.
 - PBO는 후보 **선택 절차**의 과적합 위험 진단이지 개별 전략이 미래에 수익을 낼 확률이
   아니다. 실패 후보와 시행을 누락하면 PBO도 신뢰할 수 없다.
+- v1 승격용 PBO 후보행렬은 지정 v1 Champion 선택 경로 안의 사전 등록 configuration으로
+  제한한다. Challenger의 별도 실험은 v1 Champion 선택 후보처럼 섞지 않는다.
 
-조합 수, group 수, path 구성과 PBO 후보행렬 정의는 `TBD-V03`으로 사전 등록한다. 둘 다 개발
-기간에서만 수행하며 마지막 lockbox 관측을 path, 후보행렬 또는 PBO에 넣지 않는다.
+조합 수, group 수, path 구성, PBO 후보행렬과 산출 가능 최소 조건은 `TBD-V03`으로 사전
+동결한다. purge 이후 표본·경로가 부족하거나 고정 후보 수가 PBO 추정에 충분하지 않으면
+수치를 억지로 만들지 않고 각각 `not estimable`로 기록한다. 이는 0 또는 통과를 뜻하지 않는다.
+필수 secondary 증거가 `not estimable`이면 backtest candidate 승격을 통과하지 못한다.
+CPCV와 CSCV/PBO는 개발 기간에서만 수행하며 마지막 lockbox 관측을 path, 후보행렬 또는 PBO에
+넣지 않는다.
 
 ### 6.5 Nested model selection
 
-모델 종류뿐 아니라 특징군, lookback, universe/liquidity 규칙, 결측 처리, scaling,
+모델 종류뿐 아니라 특징군, lookback, `TBD-U01`의 buffer·tie·결측 처리, liquidity 규칙, scaling,
 calibration, no-trade band, 비용·포트폴리오 파라미터까지 결과를 보고 고른 항목은 모두
 selection 대상이다. 이 선택은 outer training 내부의 nested 절차로 제한한다. outer OOS와
 lockbox는 선택에 사용하지 않는다. 7일 primary horizon, primary label과 primary 판정 지표는
@@ -437,35 +474,46 @@ implementation shortfall의 bias, MAE/분위수 오차, coverage를 종목·레�
 
 ## 8. 포트폴리오 목적함수
 
-### 8.1 연구 목적함수
+### 8.1 v1 강건 C′ 목적함수
 
-후보 포트폴리오는 다음 구성요소를 동시에 평가한다.
+포트폴리오 primary 목적함수는 Blueprint의 강건 C′를 그대로 상속한다. C′는 선택된
+위험자산 슬리브의 상대비중 $x$를 다음과 같이 구한다.
 
 $$
-J(w) =
-\mathbb{E}[\mathrm{GrossAlpha}(w)]
-- \mathbb{E}[\mathrm{TradingCost}(w-w_{prev})]
-- \lambda\,\mathrm{CVaR}(w)
-- \eta\,\mathrm{TurnoverPenalty}(w-w_{prev})
-- \xi\,\mathrm{UncertaintyPenalty}(w)
+\max_x \left[
+\tilde{\mu}^{\top}x
+-\lambda\,\mathrm{CVaR}^{regime}_{7d}(x)
+-\eta\,\mathrm{Cost/Turnover}(x)
+-\gamma\lVert x-x_B\rVert^2
+\right]
 $$
 
-첫 두 항의 차이가 예상 순수익이다. 동일 비용을 `net alpha`와 `TradingCost` 양쪽에서 두 번
-차감하지 않는다. $\lambda$, $\eta$, $\xi$, CVaR 수준·수평선과 추정법은 `TBD-P01`이며 nested
-검증과 안정성 분석으로 정한다. TurnoverPenalty는 현금 비용이 아니라 목표 불안정·모델오차를
-줄이기 위한 regularizer이며 TradingCost와의 중복을 ablation한다. CVaR를 gross 손실과 net
-손실 중 어디에 적용할지, 비용 꼬리를 stress와 중복 계상하지 않는 규칙도 `TBD-P01`에
-포함한다. $J$는 포트폴리오를 구성하는 목적함수이며 사후 acceptance metric이 아니다.
-H-NET의 primary 판정은 9장의 paired Net Calmar 차이와 별도 경제효과 기준을 따른다.
+$x_i \ge 0$, $\sum_i x_i=1$이며 이 합은 위험자산 슬리브 내부의 상대비중이다.
+$\tilde{\mu}$는 축소·불확실성 조정된 비용 차감 기대 엣지이고, $x_B$는 신뢰도와
+역변동성을 결합한 anchor/fallback이다. $x_B$와 동일가중 fallback은 현재 적격 집합에서
+비음수·합계 1로 정규화한다. $\lambda$, $\eta$, $\gamma$, shrinkage, CVaR와 비용 회계의
+calibration은 `TBD-P01`로 정한다.
+
+C′의 `Cost/Turnover(x)`는 현재 위험자산 슬리브 상대비중에서 $x$로 이동하는 마찰을 뜻한다.
+각 비용 구성요소는 $\tilde{\mu}$ 또는 이 항 중 한 곳에만 배정한다. 실제 계좌 비용과 H-NET은
+$\Delta w = EffectiveExposure_{new}x-w_{prev}$의 전환량을 7장 회계로 한 번만 반영한다.
+항별 배타적 매핑과 calibration은 `TBD-P01`로 사전 고정한다.
+
+다른 목적함수나 $x_B$ anchor penalty 제거, 현금과 위험자산을 한 최적화에 합치는 변경은
+v1 primary가 아니라 Challenger/ADR 대상이다. 결과가 더 좋아 보여도 Blueprint 또는 ADR
+변경 없이 v1 Champion 경로에 사용할 수 없다. C′는 포트폴리오 구성 계약이며 H-NET의
+acceptance는 9장의 Net Calmar와 경제효과 계약을 따른다.
 
 ### 8.2 불변 제약
 
-- `0 <= w_i <= 0.20`: 모든 종목 비중은 전체 계좌 NAV 기준이며 종목당 NAV 20%는 절대
-  안전 상한이다.
-- `sum(w_i) <= E_max(as_of) <= 1`: `E_max`는 해당 시점 위험·유동성 상태가 허용한 총
-  위험자산 노출 상한이다. Long-only이며 레버리지와 공매도를 허용하지 않는다.
-- `w_cash = 1 - sum(w_i)`: 적격 종목이 부족하거나 신호·유동성·확신이 약하면 잔여 NAV를
-  현금으로 둔다.
+- 별도 `EffectiveExposure` 엔진이 레짐 목표와 종목별 한도·적격 종목 수·유동성 제약을
+  반영해 `0 <= EffectiveExposure <= 1`을 결정한다.
+- 선택된 적격 위험자산이 0개이거나 `EffectiveExposure = 0`이면 C′와 fallback을 실행하지 않고
+  `w_cash = 1`로 둔다.
+- 계좌 비중은 `w_i = EffectiveExposure * x_i`로 환산하며 `w_i <= 0.20`을 만족해야 한다.
+  종목당 NAV 20%는 절대 안전 상한이다.
+- `w_cash = 1 - sum(w_i)`: 현금은 C′ 내부에 넣지 않는다. 적격 종목이 부족하거나
+  신호·유동성·확신이 약하면 실행 불가능한 잔여 NAV를 현금으로 둔다.
 - 보유 종목 수와 위험자산 100% 투자를 강제하지 않는다. 예를 들어 적격 종목이 3개이고
   각 20% 상한이면 최대 코인 노출은 60%, 현금은 최소 40%다.
 - 최소 주문, 주문금액/ADV 참여율, depth, 예상 impact와 capacity 제약을 적용한다.
@@ -478,10 +526,11 @@ kill switch와 주문·잔고 대사는 별도의 운영 안전장치로 유지�
 
 ### 8.3 불확실성과 현금
 
-예측 분산, calibration 오차, 데이터 품질, 모델 간 불일치 또는 drift가 커지면 기대 알파를
-축소하고 총 노출을 현금 방향으로 낮춘다. 불확실성을 기대수익, CVaR와 별도 penalty에서
-중복 처벌하지 않도록 각 항의 역할을 ablation으로 확인한다. 현금 확대는 모델 실패를 숨기는
-수익률 장식이 아니며 cash·시장·동일가중 기준선과 함께 노출·위험 조정 성과를 보고한다.
+예측 분산, calibration 오차, 데이터 품질, 모델 간 불일치 또는 drift가 커지면
+$\tilde{\mu}$를 축소하고 별도 `EffectiveExposure` 엔진이 총 노출을 현금 방향으로 낮춘다.
+같은 불확실성을 기대 엣지, CVaR와 anchor penalty에서 중복 처벌하지 않도록 각 항의 역할을
+ablation으로 확인한다. 현금 확대는 모델 실패를 숨기는 수익률 장식이 아니며 cash·시장·동일가중
+기준선과 함께 노출·위험 조정 성과를 보고한다.
 
 ---
 
@@ -505,6 +554,26 @@ Blueprint의 1차 모델 선택 지표인 **chronological walk-forward outer fol
 중앙값**을 primary portfolio metric으로 유지한다. 이 한 지표만으로 승격하지 않으며 아래
 필수 지표, paired baseline 차이, 신뢰구간과 안정성 조건을 함께 통과해야 한다. primary metric
 변경은 단순 실험 설정이 아니라 Blueprint 변경 검토 대상이다.
+
+Net Calmar 계산 계약은 다음과 같다.
+
+- 모든 outer OOS 예측을 시간순으로 연결한 하나의 after-cost wealth path를 만든다. 같은
+  `as_of`를 중복 집계하거나 fold별 초기자본을 독립 합산하지 않는다.
+- fold 경계에서 기존 포지션과 미체결 상태를 그대로 이월한다. 강제 청산·재진입 또는 무료
+  리밸런싱을 만들지 않고 새 목표와의 차이에 정상 거래비용을 부과한다.
+- 수수료, spread, impact, delay와 partial fill이 발생한 시점에 wealth와 포지션을 갱신한다.
+- 전체 연속 OOS MDD의 high-water mark는 after-cost 연속 wealth 기준이며 fold 경계에서
+  초기화하지 않는다.
+- fold Net Calmar를 계산할 때는 포지션·미체결 상태와 실제 비용을 그대로 이월하되, fold 시작
+  after-cost wealth를 1로 정규화하고 이를 fold-local high-water mark로 둔다. 해당 fold의
+  elapsed-time CAGR을 이 local MDD 절댓값으로 나누며, 이전 fold의 drawdown을 중복 계산하지 않는다.
+- non-cash fold의 local MDD가 0이면 임의 epsilon을 넣지 않고 해당 fold Calmar를
+  `not estimable`로 기록한다. 무한값 clipping과 사후 제외도 금지한다. 유효한 finite paired
+  fold 수가 `TBD-V08`의 사전 기준보다 적으면 primary Net Calmar와 H-NET을 `not estimable`로
+  기록하며 승격 통과로 간주하지 않는다.
+- KRW cash는 순수익 0, MDD 0의 `0/0`이므로 Calmar paired 비교군에서 제외한다. 대신 연속 OOS
+  최종 wealth와 net CAGR이 비용 후 cash 경로를 넘어야 하는 절대 hurdle로 사용하며 경제적
+  margin은 `TBD-V08`로 사전 고정한다.
 
 - 순수익 CAGR과 누적 초과수익
 - Net Sharpe, Net Calmar, Net Sortino
@@ -658,8 +727,11 @@ WebSocket 이벤트만을 계좌의 최종 진실로 간주하지 않는다.
 - 완결 4시간봉마다 정상 알파·레짐·포트폴리오 결정
 - 24시간 이벤트 기반 시장·위험·주문·체결·잔고 감시
 - 약 7일 목표 평균 보유기간은 고정·최소·최대 보유기간이 아님
+- 최근 30일 거래대금 상위 약 30개 적격 종목, 상장 90일 이상인 v1 PIT 유니버스 기준선
+- Blueprint가 지정한 Elastic Net + LightGBM/LambdaRank v1 Alpha Champion과 Challenger 권한
+- 위험자산 슬리브 상대비중, $x_B$ anchor와 별도 `EffectiveExposure` 엔진을 갖는 강건 C′
 - 전체 계좌 NAV 기준 종목당 최대 20%, 가변 종목 수와 현금 비중
-- 실제 `available_at`과 PIT 데이터 사용
+- actual PIT live-captured와 explicit availability model 기반 reconstructed PIT의 등급 분리
 - 실거래 주문 경로에서 LLM 제외, 자동 Champion 승격 금지
 
 ### 13.2 TBD 목록
@@ -672,19 +744,19 @@ WebSocket 이벤트만을 계좌의 최종 진실로 간주하지 않는다.
 | TBD-D01 | provisional→final late-event 창과 REST reconciliation 주기 | live 수신 지연·revision 분포와 재접속 관측 | canonical schema 승인 전 |
 | TBD-D02 | `NO_TRADE` 1분봉 OHLC/volume 구성 | 거래소 candle 의미와 recorded replay 비교 | canonicalizer 구현 전 |
 | TBD-D03 | 잔여 `MISSING`이 있는 4시간봉의 격리·허용 기준 | gap 길이·위치별 feature/label 영향과 복구 성공률 | bar builder 승인 전 |
-| TBD-D04 | 역사 데이터의 가용시각 불명 처리와 보수 지연 | live-captured latency 분포, REST 문서와 source metadata | 첫 timing-sensitive backtest 전 |
-| TBD-U01 | PIT 유동성 유니버스의 정확한 규모·lookback·상장연령·진입/퇴출 buffer | Blueprint 후보값을 출발점으로 turnover, capacity, 생존편향 민감도 비교 | outer 평가 전; 정책 변경은 Blueprint 검토 |
-| TBD-V01 | rolling/expanding window, 학습·OOS 길이와 step | 최소 레짐·label 수, drift와 추정분산 trade-off, 모의 누출검사 | 첫 outer 실행 전 |
+| TBD-D04 | reconstructed PIT availability model, 보수적 지연과 민감도 | live-captured 지연분포, REST 문서, source metadata와 provenance | 첫 역사 OHLCV backtest 전 |
+| TBD-U01 | 일 1회 v1 유니버스의 buffer, tie, 결측·불완전 데이터 처리와 민감도 | 고정된 30일·약 30종목·상장 90일 기준 주변의 turnover, capacity, PIT 재현성 비교 | outer 평가 전; 고정 기준 변경은 Blueprint/ADR 검토 |
+| TBD-V01 | rolling/expanding window, 학습·OOS 길이와 step | 최소 레짐·label 수, 연속 OOS coverage, drift와 추정분산 trade-off, 모의 누출검사 | 첫 outer 실행 전 |
 | TBD-V02 | purging interval과 embargo 길이 | 실제 label interval, 최대 horizon, 실행 지연, feature 정보수명과 민감도 | 첫 outer 실행 전 |
-| TBD-V03 | CPCV group/path와 CSCV 후보행렬·PBO 구성 | 표본길이, 연산량, path coverage와 후보 의존성 | secondary 평가 전 |
+| TBD-V03 | CPCV group/path, CSCV 후보행렬·PBO 구성과 `not estimable` 최소 조건 | purge 후 표본·경로, 고정 후보 수, path coverage와 후보 의존성 | secondary 평가 전 |
 | TBD-V04 | 마지막 chronological lockbox 기간·revision cutoff·접근자 | 충분한 독립 시장상태와 미열람 여부 확인 | 개발 OOS 열람 전 |
 | TBD-V05 | 모델별 탐색공간·seed·연산·총 trial budget | 단순 기준선 중심 pilot의 분산·비용, 동등 자원 원칙 | 모델 탐색 전 |
-| TBD-V08 | 최소 경제효과와 baseline 대비 acceptance margin | 비용오차, capital/capacity, bootstrap CI와 실용적 효용 | 첫 primary outer 결과 열람 전 |
+| TBD-V08 | cash 절대 hurdle, Calmar 적격 baseline 대비 최소 경제효과, finite paired fold 최소 수 | 비용오차, capital/capacity, bootstrap CI, fold 수와 0 MDD 발생률, 실용적 효용 | 첫 primary outer 결과 열람 전 |
 | TBD-V09 | fold·레짐·유동성 안정성 요구 | 하위표본 표본수와 영향도, 실패비용, 다중검정 통제 | 첫 primary outer 결과 열람 전 |
 | TBD-C01 | implementation-shortfall 회계식 | 주문 event schema와 replay TCA 회계시험 | 첫 비용 포함 outer 실행 전 |
 | TBD-C02 | 기준비용·2배 stress의 구성요소와 상태모형 | 당시 fee, 선택적 호가·체결, shadow TCA | 첫 비용 포함 outer 평가 전; shadow에서 재검증 |
 | TBD-C03 | cost-aware no-trade band의 후보공간·선택규칙 | 비용 예측오차, turnover/shortfall trade-off를 inner OOS로 비교; fold별 값은 inner에서만 선택 | 첫 비용 포함 outer 실행 전; 최종 refit 값은 lockbox 전 동결 |
-| TBD-P01 | CVaR 수준·수평선·추정법과 목적함수 후보공간·선택규칙 | block stress, nested stability, 비용 중복차감 ablation; fold별 값은 inner에서만 선택 | 첫 portfolio outer 실행 전; 최종 refit 값은 lockbox 전 동결 |
+| TBD-P01 | C′의 $\lambda$, $\eta$, $\gamma$, shrinkage, CVaR·비용 추정과 calibration | 비용 항별 배타적 매핑, 계좌 전환량 회계, block stress, nested stability와 중복차감 ablation; C′ 구조 변경은 제외 | 첫 portfolio outer 실행 전; 최종 refit 값은 lockbox 전 동결 |
 | TBD-P02 | 총노출, BTC beta, 상관 cluster, 유동성·capacity 제약 | stress 손실, cluster 안정성, depth/ADV 참여율과 small-live TCA | 제약이 영향을 주는 평가·단계 시작 전; 변경 시 새 candidate 평가 |
 | TBD-M01 | Precision@K의 K와 상위 후보 진단 정의 | PIT 유니버스 크기·capacity와 사전 분석계획 | outer 평가 전 |
 | TBD-M02 | CI 수준, corrected block length, 반복 수, 민감도와 multiplicity 규칙 | corrected automatic selection, Monte Carlo error와 의존성 진단 | 첫 primary outer 결과 열람 전 |
