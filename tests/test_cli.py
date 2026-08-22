@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from cassandra_trader.adapters.storage.sqlite import IngestionStats
+from cassandra_trader.apps.minute_candle_backfill import MinuteCandleBackfillResult
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.four_hour_bar import (
@@ -158,6 +159,100 @@ def test_sync_candles_command(
         "canonical_unchanged=1\n"
         f"database={database.resolve()}\n"
     )
+
+
+def test_backfill_candles_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=4)
+    database = tmp_path / "cassandra.db"
+
+    async def fake_backfill_minute_candles(
+        market: str,
+        requested_start: datetime,
+        requested_end: datetime,
+        database_path: str | Path,
+    ) -> MinuteCandleBackfillResult:
+        assert market == "KRW-BTC"
+        assert requested_start == start
+        assert requested_end == end
+        assert database_path == database
+        return MinuteCandleBackfillResult(
+            pages_fetched=2,
+            raw_received=240,
+            canonical_new=239,
+            canonical_revised=0,
+            canonical_unchanged=1,
+            earliest_candle_time=start,
+            latest_candle_time=end - timedelta(minutes=1),
+            requested_start=start,
+            requested_end=end,
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.backfill_minute_candles",
+        fake_backfill_minute_candles,
+    )
+
+    exit_code = main(
+        [
+            "backfill-candles",
+            "krw-btc",
+            "--start",
+            "2026-08-22T12:00:00Z",
+            "--end",
+            "2026-08-22T16:00:00Z",
+            "--database",
+            str(database),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.out == (
+        "pages_fetched=2\n"
+        "raw_received=240\n"
+        "canonical_new=239\n"
+        "canonical_revised=0\n"
+        "canonical_unchanged=1\n"
+        "earliest_candle_time=2026-08-22T12:00:00Z\n"
+        "latest_candle_time=2026-08-22T15:59:00Z\n"
+        "requested_start=2026-08-22T12:00:00Z\n"
+        "requested_end=2026-08-22T16:00:00Z\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("2026-08-22T12:00:00", "2026-08-22T16:00:00Z"),
+        ("2026-08-22T12:00:01Z", "2026-08-22T16:00:00Z"),
+        ("2026-08-22T12:00:00Z", "2026-08-22T12:00:00Z"),
+        ("2026-08-22T16:00:00Z", "2026-08-22T12:00:00Z"),
+    ],
+)
+def test_backfill_candles_rejects_invalid_range(
+    start: str,
+    end: str,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "backfill-candles",
+                "KRW-BTC",
+                "--start",
+                start,
+                "--end",
+                end,
+                "--database",
+                str(tmp_path / "cassandra.db"),
+            ]
+        )
 
 
 def test_four_hour_bar_complete_output(

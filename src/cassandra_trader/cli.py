@@ -8,6 +8,7 @@ from pathlib import Path
 
 from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
+from cassandra_trader.apps.minute_candle_backfill import backfill_minute_candles
 from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
     sync_recent_minute_candles,
@@ -67,6 +68,15 @@ def _four_hour_start(value: str) -> datetime:
     return parsed
 
 
+def _minute_boundary(value: str) -> datetime:
+    parsed = _utc_datetime(value)
+
+    if parsed.second != 0 or parsed.microsecond != 0:
+        raise argparse.ArgumentTypeError("timestamp must align to a one-minute UTC boundary")
+
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cassandra-trader")
     commands = parser.add_subparsers(dest="command")
@@ -114,6 +124,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="number of completed candles to request (1-200)",
     )
     sync_candles.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    backfill_candles = commands.add_parser(
+        "backfill-candles",
+        help="backfill a UTC range of Upbit one-minute candles",
+    )
+    backfill_candles.add_argument(
+        "market",
+        type=_market_code,
+        help="Upbit market code, such as KRW-BTC",
+    )
+    backfill_candles.add_argument(
+        "--start",
+        type=_minute_boundary,
+        required=True,
+        help="inclusive UTC minute boundary in ISO 8601 format",
+    )
+    backfill_candles.add_argument(
+        "--end",
+        type=_minute_boundary,
+        required=True,
+        help="exclusive UTC minute boundary in ISO 8601 format",
+    )
+    backfill_candles.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -185,6 +223,32 @@ async def _sync_candles(market: str, count: int, database: Path) -> None:
     print(f"database={database.resolve()}")
 
 
+async def _backfill_candles(
+    market: str,
+    start: datetime,
+    end: datetime,
+    database: Path,
+) -> None:
+    result = await backfill_minute_candles(market, start, end, database)
+
+    print(f"pages_fetched={result.pages_fetched}")
+    print(f"raw_received={result.raw_received}")
+    print(f"canonical_new={result.canonical_new}")
+    print(f"canonical_revised={result.canonical_revised}")
+    print(f"canonical_unchanged={result.canonical_unchanged}")
+    print(f"earliest_candle_time={_optional_utc_text(result.earliest_candle_time)}")
+    print(f"latest_candle_time={_optional_utc_text(result.latest_candle_time)}")
+    print(f"requested_start={_optional_utc_text(result.requested_start)}")
+    print(f"requested_end={_optional_utc_text(result.requested_end)}")
+
+
+def _optional_utc_text(value: datetime | None) -> str:
+    if value is None:
+        return "None"
+
+    return value.isoformat().replace("+00:00", "Z")
+
+
 def _print_four_hour_bar(
     market: str,
     start_time_utc: datetime,
@@ -237,6 +301,20 @@ def main(argv: Sequence[str] | None = None) -> int | None:
 
     if arguments.command == "sync-candles":
         asyncio.run(_sync_candles(arguments.market, arguments.count, arguments.database))
+
+    if arguments.command == "backfill-candles":
+        if arguments.start >= arguments.end:
+            parser.error("backfill-candles: --start must be before --end")
+
+        asyncio.run(
+            _backfill_candles(
+                arguments.market,
+                arguments.start,
+                arguments.end,
+                arguments.database,
+            )
+        )
+        return 0
 
     if arguments.command == "four-hour-bar":
         return _print_four_hour_bar(

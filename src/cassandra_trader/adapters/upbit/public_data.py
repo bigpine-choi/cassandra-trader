@@ -112,6 +112,7 @@ class UpbitPublicDataAdapter:
         count: int = 1,
         *,
         as_of: datetime | None = None,
+        to: datetime | None = None,
     ) -> MinuteCandleResponseBatch:
         """Fetch raw response fields alongside completed canonical candles."""
 
@@ -130,10 +131,16 @@ class UpbitPublicDataAdapter:
 
         observed_at = observed_at.astimezone(UTC)
         complete_before = observed_at.replace(second=0, microsecond=0)
+        request_to = to or complete_before
+
+        if request_to.tzinfo is None:
+            raise ValueError("to must be timezone-aware")
+
+        request_to = request_to.astimezone(UTC)
         request_parameters: dict[str, str | int] = {
             "market": normalized_market,
             "count": count,
-            "to": complete_before.isoformat().replace("+00:00", "Z"),
+            "to": request_to.isoformat().replace("+00:00", "Z"),
         }
         raw_candles = await self._list_minute_candles(
             1,
