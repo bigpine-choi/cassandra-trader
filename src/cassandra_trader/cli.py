@@ -11,11 +11,16 @@ from pathlib import Path
 from cassandra_trader.adapters.upbit.public_stream import StreamLifecycleEvent
 from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
+from cassandra_trader.apps.market_data_runtime import (
+    RuntimeRecoveryEvent,
+    run_market_data,
+)
 from cassandra_trader.apps.minute_candle_backfill import backfill_minute_candles
 from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
     sync_recent_minute_candles,
 )
+from cassandra_trader.apps.minute_reconciliation import MinuteReconciliationResult
 from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
@@ -26,6 +31,15 @@ def _positive_integer(value: str) -> int:
 
     if number < 1:
         raise argparse.ArgumentTypeError("value must be at least 1")
+
+    return number
+
+
+def _non_negative_integer(value: str) -> int:
+    number = int(value)
+
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
 
     return number
 
@@ -207,6 +221,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="stop normally after this many deduplicated data events",
     )
 
+    run_market = commands.add_parser(
+        "run-market-data",
+        help="run one market's stream and completed-minute REST reconciliation",
+    )
+    run_market.add_argument(
+        "market",
+        type=_market_code,
+        help="one Upbit market code, such as KRW-BTC",
+    )
+    run_market.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+    run_market.add_argument(
+        "--startup-lookback-minutes",
+        type=_positive_integer,
+        default=10,
+        help="rolling REST recovery window at startup",
+    )
+    run_market.add_argument(
+        "--finalization-delay-seconds",
+        type=_non_negative_integer,
+        default=3,
+        help="delay after each minute end before REST reconciliation",
+    )
+    run_market.add_argument(
+        "--max-reconciliations",
+        type=_positive_integer,
+        help="stop normally after this many completed-minute reconciliations",
+    )
+
     return parser
 
 
@@ -338,6 +385,63 @@ def _print_lifecycle(event: StreamLifecycleEvent) -> None:
     print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
 
 
+async def _run_market_data(
+    market: str,
+    database: Path,
+    startup_lookback_minutes: int,
+    finalization_delay_seconds: int,
+    max_reconciliations: int | None,
+) -> int:
+    await run_market_data(
+        market,
+        database,
+        startup_lookback_minutes=startup_lookback_minutes,
+        finalization_delay_seconds=finalization_delay_seconds,
+        max_reconciliations=max_reconciliations,
+        reconciliation_callback=_print_reconciliation,
+        lifecycle_callback=_print_lifecycle,
+        runtime_event_callback=_print_runtime_recovery,
+    )
+    return 0
+
+
+def _print_reconciliation(result: MinuteReconciliationResult) -> None:
+    payload = {
+        "market": result.market,
+        "start_time_utc": _optional_utc_text(result.start_time_utc),
+        "end_time_utc": _optional_utc_text(result.end_time_utc),
+        "status": result.status,
+        "raw_received": result.raw_received,
+        "canonical_new": result.canonical_new,
+        "canonical_revised": result.canonical_revised,
+        "canonical_unchanged": result.canonical_unchanged,
+        "available_at": _optional_utc_text(result.available_at),
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+def _print_runtime_recovery(event: RuntimeRecoveryEvent) -> None:
+    payload: dict[str, object] = {
+        "runtime": event.kind,
+        "market": event.market,
+        "start_time_utc": _optional_utc_text(event.start_time_utc),
+        "end_time_utc": _optional_utc_text(event.end_time_utc),
+    }
+
+    if event.result is not None:
+        payload.update(
+            {
+                "pages_fetched": event.result.pages_fetched,
+                "raw_received": event.result.raw_received,
+                "canonical_new": event.result.canonical_new,
+                "canonical_revised": event.result.canonical_revised,
+                "canonical_unchanged": event.result.canonical_unchanged,
+            }
+        )
+
+    print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
+
+
 def _print_four_hour_bar(
     market: str,
     start_time_utc: datetime,
@@ -416,6 +520,20 @@ def main(argv: Sequence[str] | None = None) -> int | None:
     if arguments.command == "stream-public":
         try:
             return asyncio.run(_stream_public(arguments.markets, arguments.max_events))
+        except KeyboardInterrupt:
+            return 0
+
+    if arguments.command == "run-market-data":
+        try:
+            return asyncio.run(
+                _run_market_data(
+                    arguments.market,
+                    arguments.database,
+                    arguments.startup_lookback_minutes,
+                    arguments.finalization_delay_seconds,
+                    arguments.max_reconciliations,
+                )
+            )
         except KeyboardInterrupt:
             return 0
 
