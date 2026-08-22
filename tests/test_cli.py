@@ -7,6 +7,12 @@ import pytest
 from cassandra_trader.adapters.storage.sqlite import IngestionStats
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
+from cassandra_trader.domain.four_hour_bar import (
+    FourHourBarReason,
+    FourHourBarResult,
+    FourHourBarStatus,
+    FourHourCandle,
+)
 from cassandra_trader.domain.market import TradingPair
 
 
@@ -152,3 +158,161 @@ def test_sync_candles_command(
         "canonical_unchanged=1\n"
         f"database={database.resolve()}\n"
     )
+
+
+def test_four_hour_bar_complete_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    end = start + timedelta(hours=4)
+    candle = FourHourCandle(
+        market="KRW-BTC",
+        start_time_utc=start,
+        end_time_utc=end,
+        open=Decimal("100"),
+        high=Decimal("120"),
+        low=Decimal("90"),
+        close=Decimal("110"),
+        base_volume=Decimal("24.5"),
+        quote_volume=Decimal("2500.75"),
+    )
+
+    def fake_derive_four_hour_bar(
+        market: str,
+        start_time_utc: datetime,
+        as_of: datetime,
+        database: str | Path,
+    ) -> FourHourBarResult:
+        assert market == "KRW-BTC"
+        assert start_time_utc == start
+        assert as_of == end + timedelta(minutes=10)
+        return FourHourBarResult(
+            status=FourHourBarStatus.COMPLETE,
+            market=market,
+            start_time_utc=start,
+            end_time_utc=end,
+            expected_count=240,
+            actual_count=240,
+            missing_minute_starts=(),
+            candle=candle,
+            reason=None,
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.derive_four_hour_bar",
+        fake_derive_four_hour_bar,
+    )
+
+    exit_code = main(
+        [
+            "four-hour-bar",
+            "KRW-BTC",
+            "--start",
+            "2026-08-22T12:00:00Z",
+            "--as-of",
+            "2026-08-22T16:10:00Z",
+            "--database",
+            str(tmp_path / "cassandra.db"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.out == (
+        "status=COMPLETE\n"
+        "market=KRW-BTC\n"
+        "start_time_utc=2026-08-22T12:00:00Z\n"
+        "end_time_utc=2026-08-22T16:00:00Z\n"
+        "open=100\n"
+        "high=120\n"
+        "low=90\n"
+        "close=110\n"
+        "base_volume=24.5\n"
+        "quote_volume=2500.75\n"
+    )
+
+
+def test_four_hour_bar_incomplete_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    missing = start + timedelta(minutes=42)
+
+    def fake_derive_four_hour_bar(
+        market: str,
+        start_time_utc: datetime,
+        as_of: datetime,
+        database: str | Path,
+    ) -> FourHourBarResult:
+        return FourHourBarResult(
+            status=FourHourBarStatus.INCOMPLETE,
+            market=market,
+            start_time_utc=start,
+            end_time_utc=start + timedelta(hours=4),
+            expected_count=240,
+            actual_count=239,
+            missing_minute_starts=(missing,),
+            candle=None,
+            reason=FourHourBarReason.MISSING_MINUTES,
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.derive_four_hour_bar",
+        fake_derive_four_hour_bar,
+    )
+
+    exit_code = main(
+        [
+            "four-hour-bar",
+            "KRW-BTC",
+            "--start",
+            "2026-08-22T12:00:00Z",
+            "--as-of",
+            "2026-08-22T16:10:00Z",
+            "--database",
+            str(tmp_path / "cassandra.db"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.out == (
+        "status=INCOMPLETE\n"
+        "market=KRW-BTC\n"
+        "start_time_utc=2026-08-22T12:00:00Z\n"
+        "end_time_utc=2026-08-22T16:00:00Z\n"
+        "reason=MISSING_MINUTES\n"
+        "actual_count=239\n"
+        "expected_count=240\n"
+        "missing_count=1\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--start", "2026-08-22T13:00:00Z", "--as-of", "2026-08-22T16:10:00Z"],
+        ["--start", "2026-08-22T12:00:00", "--as-of", "2026-08-22T16:10:00Z"],
+        ["--start", "2026-08-22T12:00:00Z", "--as-of", "2026-08-22T16:10:00"],
+    ],
+)
+def test_four_hour_bar_rejects_invalid_utc_arguments(
+    arguments: list[str],
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "four-hour-bar",
+                "KRW-BTC",
+                *arguments,
+                "--database",
+                str(tmp_path / "cassandra.db"),
+            ]
+        )

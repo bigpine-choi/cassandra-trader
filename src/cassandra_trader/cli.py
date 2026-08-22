@@ -3,13 +3,16 @@
 import argparse
 import asyncio
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
 from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
     sync_recent_minute_candles,
 )
+from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 
 
 def _positive_integer(value: str) -> int:
@@ -38,6 +41,30 @@ def _market_code(value: str) -> str:
         raise argparse.ArgumentTypeError("market must look like KRW-BTC")
 
     return normalized
+
+
+def _utc_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("timestamp must be valid ISO 8601") from error
+
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("timestamp must include a UTC timezone")
+
+    if parsed.utcoffset() != timedelta(0):
+        raise argparse.ArgumentTypeError("timestamp must use UTC (Z or +00:00)")
+
+    return parsed.astimezone(UTC)
+
+
+def _four_hour_start(value: str) -> datetime:
+    parsed = _utc_datetime(value)
+
+    if parsed.hour % 4 != 0 or parsed.minute != 0 or parsed.second != 0 or parsed.microsecond != 0:
+        raise argparse.ArgumentTypeError("start must align to a four-hour UTC boundary")
+
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -93,6 +120,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite database path",
     )
 
+    four_hour_bar = commands.add_parser(
+        "four-hour-bar",
+        help="derive one completed UTC four-hour bar from stored minute candles",
+    )
+    four_hour_bar.add_argument(
+        "market",
+        type=_market_code,
+        help="market code, such as KRW-BTC",
+    )
+    four_hour_bar.add_argument(
+        "--start",
+        type=_four_hour_start,
+        required=True,
+        help="four-hour UTC boundary in ISO 8601 format",
+    )
+    four_hour_bar.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC information cutoff in ISO 8601 format",
+    )
+    four_hour_bar.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
     return parser
 
 
@@ -130,7 +185,41 @@ async def _sync_candles(market: str, count: int, database: Path) -> None:
     print(f"database={database.resolve()}")
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def _print_four_hour_bar(
+    market: str,
+    start_time_utc: datetime,
+    as_of: datetime,
+    database: Path,
+) -> int:
+    result = derive_four_hour_bar(market, start_time_utc, as_of, database)
+    start_text = result.start_time_utc.isoformat().replace("+00:00", "Z")
+    end_text = result.end_time_utc.isoformat().replace("+00:00", "Z")
+
+    print(f"status={result.status}")
+    print(f"market={result.market}")
+    print(f"start_time_utc={start_text}")
+    print(f"end_time_utc={end_text}")
+
+    if result.status is FourHourBarStatus.INCOMPLETE:
+        print(f"reason={result.reason}")
+        print(f"actual_count={result.actual_count}")
+        print(f"expected_count={result.expected_count}")
+        print(f"missing_count={len(result.missing_minute_starts)}")
+        return 2
+
+    if result.candle is None:
+        raise RuntimeError("COMPLETE result must contain a four-hour candle")
+
+    print(f"open={result.candle.open}")
+    print(f"high={result.candle.high}")
+    print(f"low={result.candle.low}")
+    print(f"close={result.candle.close}")
+    print(f"base_volume={result.candle.base_volume}")
+    print(f"quote_volume={result.candle.quote_volume}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int | None:
     """Run the Cassandra Trader command-line interface."""
 
     parser = _build_parser()
@@ -148,3 +237,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if arguments.command == "sync-candles":
         asyncio.run(_sync_candles(arguments.market, arguments.count, arguments.database))
+
+    if arguments.command == "four-hour-bar":
+        return _print_four_hour_bar(
+            arguments.market,
+            arguments.start,
+            arguments.as_of,
+            arguments.database,
+        )
+
+    return None
