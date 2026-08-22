@@ -37,16 +37,19 @@ def _raw_candle(
     trade_price: str = "105",
     base_volume: str = "1.5",
     quote_volume: str = "150",
+    timestamp: int = 1735732800123,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         market=market,
         candle_date_time_utc=start_time,
+        candle_date_time_kst="2025-01-01T21:00:00",
         opening_price=opening_price,
         high_price=high_price,
         low_price=low_price,
         trade_price=trade_price,
         candle_acc_trade_volume=base_volume,
         candle_acc_trade_price=quote_volume,
+        timestamp=timestamp,
     )
 
 
@@ -126,6 +129,35 @@ def test_list_minute_candles_maps_sdk_response() -> None:
     assert candles[0].close == Decimal("105")
     assert candles[0].base_volume == Decimal("1.5")
     assert candles[0].quote_volume == Decimal("150")
+
+
+def test_fetch_minute_candle_batch_preserves_sdk_response_fields() -> None:
+    async def fake_list(
+        unit: int,
+        *,
+        market: str,
+        count: int,
+        to: str,
+    ) -> CandleListMinutesResponse:
+        return cast(CandleListMinutesResponse, [_raw_candle("2025-01-01T12:00:00")])
+
+    adapter = UpbitPublicDataAdapter(list_minute_candles=fake_list)
+
+    batch = asyncio.run(
+        adapter.fetch_minute_candle_batch(
+            "KRW-BTC",
+            1,
+            as_of=datetime(2025, 1, 1, 12, 2, tzinfo=UTC),
+        )
+    )
+
+    assert batch.endpoint == "/v1/candles/minutes/1"
+    assert batch.request_parameters["market"] == "KRW-BTC"
+    assert batch.observations[0].response_order == 0
+    assert batch.observations[0].source_candle_time == "2025-01-01T12:00:00Z"
+    assert batch.observations[0].raw_payload["timestamp"] == 1735732800123
+    assert batch.observations[0].raw_payload["candle_date_time_kst"] == ("2025-01-01T21:00:00")
+    assert batch.observations[0].candle is not None
 
 
 def test_list_minute_candles_sorts_oldest_first() -> None:

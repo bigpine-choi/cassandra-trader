@@ -26,6 +26,9 @@ data/
 logs/
 artifacts/
 models/
+*.db
+*.db-wal
+*.db-shm
 
 # IDE and operating system
 .vscode/
