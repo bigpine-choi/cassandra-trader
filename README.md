@@ -20,7 +20,7 @@
 - [x] 공식 Upbit Python SDK 연동
 - [x] 업비트 KRW 거래 페어 조회
 - [x] 업비트 응답과 내부 도메인 모델 분리
-- [ ] 4시간봉 수집 및 정규화
+- [ ] canonical 1분봉 수집·정규화 및 완결 4시간봉 파생
 - [ ] point-in-time 투자 유니버스
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
@@ -70,9 +70,10 @@ uv run pytest
 
 ## 설계 문서
 
-전체 아키텍처와 전략 기준선은 다음 문서에서 관리합니다.
+전체 아키텍처, 전략 기준선과 연구 증거 규약은 다음 문서에서 관리합니다.
 
 - [Cassandra Blueprint v1.0](docs/CASSANDRA_BLUEPRINT_v1.0.md)
+- [Cassandra Research Protocol v1.0](docs/CASSANDRA_RESEARCH_PROTOCOL_v1.0.md)
 
 ## 보안
 
