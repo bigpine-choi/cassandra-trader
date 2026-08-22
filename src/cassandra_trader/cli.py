@@ -2,10 +2,13 @@
 
 import argparse
 import asyncio
+import json
+import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from cassandra_trader.adapters.upbit.public_stream import StreamLifecycleEvent
 from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
 from cassandra_trader.apps.minute_candle_backfill import backfill_minute_candles
@@ -13,7 +16,9 @@ from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
     sync_recent_minute_candles,
 )
+from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
+from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
 
 
 def _positive_integer(value: str) -> int:
@@ -186,6 +191,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite database path",
     )
 
+    stream_public = commands.add_parser(
+        "stream-public",
+        help="stream public Upbit ticker and one-minute candle updates",
+    )
+    stream_public.add_argument(
+        "markets",
+        type=_market_code,
+        nargs="+",
+        help="one or more Upbit market codes",
+    )
+    stream_public.add_argument(
+        "--max-events",
+        type=_positive_integer,
+        help="stop normally after this many deduplicated data events",
+    )
+
     return parser
 
 
@@ -247,6 +268,74 @@ def _optional_utc_text(value: datetime | None) -> str:
         return "None"
 
     return value.isoformat().replace("+00:00", "Z")
+
+
+async def _stream_public(markets: list[str], max_events: int | None) -> int:
+    events = stream_public_events(
+        markets,
+        lifecycle_callback=_print_lifecycle,
+    )
+    emitted = 0
+
+    try:
+        async for event in events:
+            print(json.dumps(_public_event_payload(event), separators=(",", ":")))
+            emitted += 1
+
+            if max_events is not None and emitted >= max_events:
+                break
+    finally:
+        await events.aclose()
+
+    return 0
+
+
+def _public_event_payload(event: PublicMarketEvent) -> dict[str, str]:
+    if isinstance(event, TickerEvent):
+        return {
+            "event_type": "ticker",
+            "market": event.market,
+            "trade_price": str(event.trade_price),
+            "signed_change_rate": str(event.signed_change_rate),
+            "acc_trade_price_24h": str(event.acc_trade_price_24h),
+            "trade_timestamp_utc": _optional_utc_text(event.trade_timestamp_utc),
+            "received_at": _optional_utc_text(event.received_at),
+            "stream_type": event.stream_type,
+        }
+
+    if not isinstance(event, MinuteCandleUpdate):
+        raise TypeError(f"unsupported public event: {type(event).__name__}")
+
+    return {
+        "event_type": "minute_candle_update",
+        "market": event.market,
+        "start_time_utc": _optional_utc_text(event.start_time_utc),
+        "end_time_utc": _optional_utc_text(event.end_time_utc),
+        "open": str(event.open),
+        "high": str(event.high),
+        "low": str(event.low),
+        "close": str(event.close),
+        "base_volume": str(event.base_volume),
+        "quote_volume": str(event.quote_volume),
+        "event_time_utc": _optional_utc_text(event.event_time_utc),
+        "received_at": _optional_utc_text(event.received_at),
+        "stream_type": event.stream_type,
+    }
+
+
+def _print_lifecycle(event: StreamLifecycleEvent) -> None:
+    payload: dict[str, object] = {
+        "lifecycle": event.status,
+        "attempt": event.attempt,
+    }
+
+    if event.delay_seconds is not None:
+        payload["delay_seconds"] = event.delay_seconds
+
+    if event.detail is not None:
+        payload["detail"] = event.detail
+
+    print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
 
 
 def _print_four_hour_bar(
@@ -323,5 +412,11 @@ def main(argv: Sequence[str] | None = None) -> int | None:
             arguments.as_of,
             arguments.database,
         )
+
+    if arguments.command == "stream-public":
+        try:
+            return asyncio.run(_stream_public(arguments.markets, arguments.max_events))
+        except KeyboardInterrupt:
+            return 0
 
     return None
