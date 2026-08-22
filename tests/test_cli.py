@@ -10,7 +10,15 @@ from cassandra_trader.adapters.upbit.public_stream import (
     LifecycleStatus,
     StreamLifecycleEvent,
 )
+from cassandra_trader.apps.market_data_runtime import (
+    RuntimeRecoveryEvent,
+    RuntimeRecoveryKind,
+)
 from cassandra_trader.apps.minute_candle_backfill import MinuteCandleBackfillResult
+from cassandra_trader.apps.minute_reconciliation import (
+    MinuteReconciliationResult,
+    MinuteReconciliationStatus,
+)
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.four_hour_bar import (
@@ -521,3 +529,152 @@ def test_stream_public_handles_keyboard_interrupt_without_traceback(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Traceback" not in captured.err
+
+
+def test_run_market_data_outputs_only_reconciliation_to_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cassandra.db"
+    start = datetime(2026, 8, 22, 17, 32, tzinfo=UTC)
+    end = start + timedelta(minutes=1)
+    backfill = MinuteCandleBackfillResult(
+        pages_fetched=1,
+        raw_received=10,
+        canonical_new=9,
+        canonical_revised=0,
+        canonical_unchanged=1,
+        earliest_candle_time=start - timedelta(minutes=9),
+        latest_candle_time=start,
+        requested_start=start - timedelta(minutes=9),
+        requested_end=end,
+    )
+    reconciliation = MinuteReconciliationResult(
+        market="KRW-BTC",
+        start_time_utc=start,
+        end_time_utc=end,
+        status=MinuteReconciliationStatus.CONFIRMED,
+        raw_received=1,
+        canonical_new=0,
+        canonical_revised=0,
+        canonical_unchanged=1,
+        available_at=end + timedelta(seconds=3),
+    )
+
+    async def fake_run_market_data(
+        market,
+        database_path,
+        *,
+        startup_lookback_minutes,
+        finalization_delay_seconds,
+        max_reconciliations,
+        reconciliation_callback,
+        lifecycle_callback,
+        runtime_event_callback,
+    ):
+        assert market == "KRW-BTC"
+        assert database_path == database
+        assert startup_lookback_minutes == 5
+        assert finalization_delay_seconds == 0
+        assert max_reconciliations == 1
+        runtime_event_callback(
+            RuntimeRecoveryEvent(
+                kind=RuntimeRecoveryKind.STARTUP_STARTED,
+                market=market,
+                start_time_utc=backfill.requested_start,
+                end_time_utc=end,
+            )
+        )
+        lifecycle_callback(StreamLifecycleEvent(status=LifecycleStatus.CONNECTED, attempt=0))
+        runtime_event_callback(
+            RuntimeRecoveryEvent(
+                kind=RuntimeRecoveryKind.STARTUP_COMPLETED,
+                market=market,
+                start_time_utc=backfill.requested_start,
+                end_time_utc=end,
+                result=backfill,
+            )
+        )
+        reconciliation_callback(reconciliation)
+        lifecycle_callback(StreamLifecycleEvent(status=LifecycleStatus.DISCONNECTED, attempt=0))
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.run_market_data",
+        fake_run_market_data,
+    )
+
+    exit_code = main(
+        [
+            "run-market-data",
+            "krw-btc",
+            "--database",
+            str(database),
+            "--startup-lookback-minutes",
+            "5",
+            "--finalization-delay-seconds",
+            "0",
+            "--max-reconciliations",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    stdout_lines = [json.loads(line) for line in captured.out.splitlines()]
+    stderr_lines = [json.loads(line) for line in captured.err.splitlines()]
+
+    assert exit_code == 0
+    assert stdout_lines == [
+        {
+            "market": "KRW-BTC",
+            "start_time_utc": "2026-08-22T17:32:00Z",
+            "end_time_utc": "2026-08-22T17:33:00Z",
+            "status": "CONFIRMED",
+            "raw_received": 1,
+            "canonical_new": 0,
+            "canonical_revised": 0,
+            "canonical_unchanged": 1,
+            "available_at": "2026-08-22T17:33:03Z",
+        }
+    ]
+    assert [line.get("lifecycle") or line.get("runtime") for line in stderr_lines] == [
+        "STARTUP_RECOVERY_STARTED",
+        "CONNECTED",
+        "STARTUP_RECOVERY_COMPLETED",
+        "DISCONNECTED",
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["run-market-data", "BTC", "--database", "test.db"],
+        [
+            "run-market-data",
+            "KRW-BTC",
+            "--database",
+            "test.db",
+            "--startup-lookback-minutes",
+            "0",
+        ],
+        [
+            "run-market-data",
+            "KRW-BTC",
+            "--database",
+            "test.db",
+            "--finalization-delay-seconds",
+            "-1",
+        ],
+        [
+            "run-market-data",
+            "KRW-BTC",
+            "--database",
+            "test.db",
+            "--max-reconciliations",
+            "0",
+        ],
+    ],
+)
+def test_run_market_data_rejects_invalid_arguments(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(arguments)

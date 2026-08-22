@@ -74,6 +74,28 @@ async def backfill_minute_candles_with_fetcher(
 ) -> MinuteCandleBackfillResult:
     """Fetch and persist pages using an injected network boundary."""
 
+    with SqliteMinuteCandleRepository(database) as repository:
+        return await backfill_minute_candles_into_repository(
+            market,
+            start,
+            end,
+            repository,
+            fetch_page=fetch_page,
+            observed_at=observed_at,
+        )
+
+
+async def backfill_minute_candles_into_repository(
+    market: str,
+    start: datetime,
+    end: datetime,
+    repository: SqliteMinuteCandleRepository,
+    *,
+    fetch_page: FetchMinuteCandlePage,
+    observed_at: datetime | None = None,
+) -> MinuteCandleBackfillResult:
+    """Backfill a range into an already-open SQLite repository."""
+
     _validate_range(start, end)
     effective_observed_at = observed_at or datetime.now(UTC)
     _validate_utc(effective_observed_at, "observed_at")
@@ -86,52 +108,51 @@ async def backfill_minute_candles_with_fetcher(
     canonical_unchanged = 0
     candle_times: set[datetime] = set()
 
-    with SqliteMinuteCandleRepository(database) as repository:
-        while True:
-            batch = await fetch_page(
-                market,
-                _PAGE_SIZE,
-                as_of=effective_observed_at,
-                to=cursor,
-            )
-            pages_fetched += 1
-            raw_received += len(batch.observations)
-            records = tuple(
-                _raw_record(observation, start, end, effective_observed_at)
-                for observation in batch.observations
-            )
-            stats = repository.ingest_batch(
-                batch_id=str(uuid4()),
-                source="upbit",
-                endpoint=batch.endpoint,
-                request_parameters=batch.request_parameters,
-                received_at=batch.received_at,
-                records=records,
-            )
-            canonical_new += stats.new_canonical_count
-            canonical_revised += stats.revised_canonical_count
-            canonical_unchanged += stats.unchanged_canonical_count
+    while True:
+        batch = await fetch_page(
+            market,
+            _PAGE_SIZE,
+            as_of=effective_observed_at,
+            to=cursor,
+        )
+        pages_fetched += 1
+        raw_received += len(batch.observations)
+        records = tuple(
+            _raw_record(observation, start, end, effective_observed_at)
+            for observation in batch.observations
+        )
+        stats = repository.ingest_batch(
+            batch_id=str(uuid4()),
+            source="upbit",
+            endpoint=batch.endpoint,
+            request_parameters=batch.request_parameters,
+            received_at=batch.received_at,
+            records=records,
+        )
+        canonical_new += stats.new_canonical_count
+        canonical_revised += stats.revised_canonical_count
+        canonical_unchanged += stats.unchanged_canonical_count
 
-            candle_times.update(
-                record.candle.start_time_utc for record in records if record.candle is not None
-            )
+        candle_times.update(
+            record.candle.start_time_utc for record in records if record.candle is not None
+        )
 
-            if not batch.observations:
-                break
+        if not batch.observations:
+            break
 
-            ordered_observations = sorted(
-                batch.observations,
-                key=_observation_start,
-            )
-            earliest = _observation_start(ordered_observations[0])
+        ordered_observations = sorted(
+            batch.observations,
+            key=_observation_start,
+        )
+        earliest = _observation_start(ordered_observations[0])
 
-            if earliest <= start:
-                break
+        if earliest <= start:
+            break
 
-            if earliest >= cursor:
-                raise RuntimeError("minute-candle cursor did not move backward")
+        if earliest >= cursor:
+            raise RuntimeError("minute-candle cursor did not move backward")
 
-            cursor = earliest
+        cursor = earliest
 
     return MinuteCandleBackfillResult(
         pages_fetched=pages_fetched,
