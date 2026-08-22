@@ -161,8 +161,13 @@ class SqliteMinuteCandleRepository:
     ) -> IngestionStats:
         """Atomically append a raw batch and any necessary canonical revisions."""
 
+        effective_ingested_at = ingested_at or datetime.now(UTC)
         received_text = _utc_text(received_at)
-        ingested_text = _utc_text(ingested_at or datetime.now(UTC))
+        ingested_text = _utc_text(effective_ingested_at)
+
+        if received_at > effective_ingested_at:
+            raise ValueError("received_at must not be after ingested_at")
+
         request_json = _json_text(request_parameters)
 
         new_count = 0
@@ -284,7 +289,7 @@ class SqliteMinuteCandleRepository:
                         revision,
                         content_sha256,
                         raw_cursor.lastrowid,
-                        received_text,
+                        ingested_text,
                     ),
                 )
 
@@ -340,26 +345,35 @@ class SqliteMinuteCandleRepository:
         return tuple(_stored_candle(row) for row in rows)
 
     def _migrate(self) -> None:
-        self._connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            )
-            """
-        )
-        applied = self._connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = ?",
-            (_SCHEMA_VERSION,),
-        ).fetchone()
+        self._connection.execute("BEGIN IMMEDIATE")
 
-        if applied is None:
-            self._connection.executescript(_SCHEMA_SQL)
+        try:
             self._connection.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, _utc_text(datetime.now(UTC))),
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
             )
+            applied = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?",
+                (_SCHEMA_VERSION,),
+            ).fetchone()
+
+            if applied is None:
+                for statement in _schema_statements():
+                    self._connection.execute(statement)
+
+                self._connection.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (_SCHEMA_VERSION, _utc_text(datetime.now(UTC))),
+                )
+
             self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def _verify_replayed_batch(
         self,
@@ -478,3 +492,21 @@ def _json_text(value: object) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _schema_statements() -> tuple[str, ...]:
+    statements: list[str] = []
+    buffer: list[str] = []
+
+    for line in _SCHEMA_SQL.splitlines():
+        buffer.append(line)
+        candidate = "\n".join(buffer).strip()
+
+        if candidate and sqlite3.complete_statement(candidate):
+            statements.append(candidate)
+            buffer.clear()
+
+    if any(line.strip() for line in buffer):
+        raise RuntimeError("incomplete SQLite migration statement")
+
+    return tuple(statements)

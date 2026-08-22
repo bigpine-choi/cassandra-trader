@@ -75,6 +75,7 @@ def _ingest(
     batch_id: str,
     records: tuple[RawMinuteCandleInput, ...],
     received_at: datetime = _RECEIVED,
+    ingested_at: datetime | None = None,
 ):
     return repository.ingest_batch(
         batch_id=batch_id,
@@ -82,7 +83,7 @@ def _ingest(
         endpoint="/v1/candles/minutes/1",
         request_parameters={"market": "KRW-BTC", "count": len(records)},
         received_at=received_at,
-        ingested_at=received_at + timedelta(seconds=1),
+        ingested_at=ingested_at or received_at + timedelta(seconds=1),
         records=records,
     )
 
@@ -118,6 +119,57 @@ def test_stores_first_raw_and_canonical_batch(tmp_path: Path) -> None:
     assert json.loads(raw_json) == record.raw_payload
     assert json.loads(raw_json)["timestamp"] == 1735732800123
     assert payload_sha256 == hashlib.sha256(raw_json.encode()).hexdigest()
+
+
+def test_available_at_uses_ingested_at_after_validation(tmp_path: Path) -> None:
+    database = tmp_path / "cassandra.db"
+    ingested_at = _RECEIVED + timedelta(seconds=30)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(
+            repository,
+            batch_id="batch-1",
+            records=(_record(),),
+            received_at=_RECEIVED,
+            ingested_at=ingested_at,
+        )
+        stored = repository.get_current_minute_candle("KRW-BTC", _START)
+
+    assert stored is not None
+    assert stored.available_at == ingested_at
+
+
+def test_rejects_received_at_after_ingested_at(tmp_path: Path) -> None:
+    database = tmp_path / "cassandra.db"
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        with pytest.raises(ValueError, match="received_at"):
+            _ingest(
+                repository,
+                batch_id="batch-1",
+                records=(_record(),),
+                received_at=_RECEIVED,
+                ingested_at=_RECEIVED - timedelta(seconds=1),
+            )
+
+    assert _count(database, "raw_ingestion_batches") == 0
+
+
+def test_reopening_database_does_not_repeat_migration(tmp_path: Path) -> None:
+    database = tmp_path / "cassandra.db"
+
+    with SqliteMinuteCandleRepository(database):
+        pass
+
+    with SqliteMinuteCandleRepository(database):
+        pass
+
+    with sqlite3.connect(database) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+
+    assert versions == [(1,)]
 
 
 def test_replaying_same_recorded_batch_is_idempotent(tmp_path: Path) -> None:
@@ -193,7 +245,7 @@ def test_current_query_returns_highest_revision(tmp_path: Path) -> None:
     assert current is not None
     assert current.revision == 2
     assert current.candle.close == Decimal("106")
-    assert current.available_at == _RECEIVED + timedelta(minutes=1)
+    assert current.available_at == _RECEIVED + timedelta(minutes=1, seconds=1)
 
 
 def test_decimal_and_utc_round_trip(tmp_path: Path) -> None:
