@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Sequence
 
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
+from cassandra_trader.apps.minute_candles import fetch_recent_minute_candles
 
 
 def _positive_integer(value: str) -> int:
@@ -14,6 +15,25 @@ def _positive_integer(value: str) -> int:
         raise argparse.ArgumentTypeError("value must be at least 1")
 
     return number
+
+
+def _candle_count(value: str) -> int:
+    number = _positive_integer(value)
+
+    if number > 200:
+        raise argparse.ArgumentTypeError("value must not exceed 200")
+
+    return number
+
+
+def _market_code(value: str) -> str:
+    normalized = value.strip().upper()
+    quote, separator, base = normalized.partition("-")
+
+    if not separator or not quote.isalnum() or not base.isalnum():
+        raise argparse.ArgumentTypeError("market must look like KRW-BTC")
+
+    return normalized
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -31,6 +51,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="maximum number of pairs to display",
     )
 
+    candles = commands.add_parser(
+        "candles",
+        help="show recent completed Upbit one-minute candles",
+    )
+    candles.add_argument(
+        "market",
+        type=_market_code,
+        help="Upbit market code, such as KRW-BTC",
+    )
+    candles.add_argument(
+        "--count",
+        type=_candle_count,
+        default=5,
+        help="number of completed candles to display (1-200)",
+    )
+
     return parser
 
 
@@ -42,6 +78,20 @@ async def _print_markets(limit: int) -> None:
     for pair in pairs[:limit]:
         warning = " [WARNING]" if pair.is_warning else ""
         print(f"{pair.code:<12} {pair.korean_name}{warning}")
+
+
+async def _print_candles(market: str, count: int) -> None:
+    candles = await fetch_recent_minute_candles(market, count)
+
+    print(f"{market} completed 1m candles: {len(candles)}")
+
+    for candle in candles:
+        start_time = candle.start_time_utc.isoformat().replace("+00:00", "Z")
+        print(
+            f"{start_time} "
+            f"O={candle.open} H={candle.high} L={candle.low} C={candle.close} "
+            f"base_volume={candle.base_volume} quote_volume={candle.quote_volume}"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -56,3 +106,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if arguments.command == "markets":
         asyncio.run(_print_markets(arguments.limit))
+
+    if arguments.command == "candles":
+        asyncio.run(_print_candles(arguments.market, arguments.count))
