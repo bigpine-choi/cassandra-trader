@@ -208,21 +208,29 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
 유니버스는 일 1회 PIT snapshot으로 갱신하고, 각 4시간 `as_of`는 그때 유효한 최신 snapshot만
 사용한다. snapshot은 그때까지 알려진 상태와 거래대금·유동성만으로 재구성한다.
 
-- v1 기준선은 최근 30일 거래대금 상위 약 30개 적격 KRW 종목이며, 상장 후 90일 미만 종목은
-  제외한다.
+- catalog universe는 Upbit KRW 전체 market이며 warning market의 사실 데이터와 metadata도
+  snapshot과 수집 범위에 보존한다.
+- analysis universe는 fresh catalog의 non-warning market 전체다. feature, 시장 폭, 모멘텀,
+  변동성, 횡단면 분석은 liquidity top-N이 아니라 이 전체 집합을 사용한다.
+- 실제 신호 평가와 주문 가능 후보를 위한 execution candidate universe만 point-in-time 30일
+  유동성 top-N shortlist를 사용한다. 초기 운영 목표 `top_n=100`은 코드 상수가 아니라 실행
+  설정과 manifest에 명시한다.
+- execution candidate 중 최대 6개 보유를 목표로 하지만 signal·portfolio·execution과 상장 후
+  90일·authoritative listing history 정책은 아직 구현되지 않았다.
 - 최종 생존 종목 목록으로 과거를 필터링하지 않는다.
 - 상장폐지·유의·정지 종목과 실패한 데이터 구간을 역사에서 제거하지 않는다.
-- Blueprint 정책에 따라 스테이블코인은 거래 유니버스에서 제외하고, BTC·ETH 상태는 거래대상
-  편입 여부와 무관하게 레짐 입력에 항상 포함한다.
+- BTC·ETH를 포함한 fresh non-warning market 전체를 analysis universe에 유지한다. 향후 별도
+  execution 제외 정책이 필요하면 analysis universe를 축소하지 않고 versioned policy로 분리한다.
 - 오늘 수정된 종목 메타데이터를 과거 snapshot에 소급 적용하지 않는다.
 - cross-coin, breadth, BTC/ETH 상태도 같은 `as_of` 유니버스와 revision만 사용한다.
 - 외부 지수나 데이터가 당시 이용 가능했음을 입증할 수 없으면 학습 입력이 아니라 사후
   진단으로만 사용한다.
 
-30일 lookback, 약 30종목 목표 규모와 상장 90일 기준은 성과를 보고 바꾸지 않는다. 약 30개는
-튜닝 가능한 모델 파라미터가 아니며, 실제 구성과 종목 수는 사전 동결한 진입·퇴출 buffer,
-동률, 결측·불완전 데이터 규칙으로 결정론적으로 정한다. 이 규칙과 기준선 주변 민감도만
-`TBD-U01`로 정한다. 적격 종목이 부족하면 유니버스를 억지로 채우지 않는다.
+30일 lookback과 상장 90일 기준은 서로 다른 정책 축이다. execution shortlist의 초기
+`top_n=100`은 각 실행에서 명시하고 domain이나 application에 하드코딩하지 않는다. 설정 변경은
+manifest와 versioned policy/config 근거로 추적한다. 실제 구성은 동률, 결측·불완전 데이터
+규칙으로 결정론적으로 정하고 이 설정 주변의 민감도는 `TBD-U01`로 기록한다. 후보가 부족하면
+shortlist를 억지로 채우지 않는다.
 
 ### 3.6 재현성 데이터 manifest
 
@@ -727,7 +735,7 @@ WebSocket 이벤트만을 계좌의 최종 진실로 간주하지 않는다.
 - 완결 4시간봉마다 정상 알파·레짐·포트폴리오 결정
 - 24시간 이벤트 기반 시장·위험·주문·체결·잔고 감시
 - 약 7일 목표 평균 보유기간은 고정·최소·최대 보유기간이 아님
-- 최근 30일 거래대금 상위 약 30개 적격 종목, 상장 90일 이상인 v1 PIT 유니버스 기준선
+- Upbit KRW 전체 catalog, fresh non-warning 전체 analysis universe, 명시적 `top_n=100` 초기 execution shortlist
 - Blueprint가 지정한 Elastic Net + LightGBM/LambdaRank v1 Alpha Champion과 Challenger 권한
 - 위험자산 슬리브 상대비중, $x_B$ anchor와 별도 `EffectiveExposure` 엔진을 갖는 강건 C′
 - 전체 계좌 NAV 기준 종목당 최대 20%, 가변 종목 수와 현금 비중
@@ -745,7 +753,7 @@ WebSocket 이벤트만을 계좌의 최종 진실로 간주하지 않는다.
 | TBD-D02 | `NO_TRADE` 1분봉 OHLC/volume 구성 | 거래소 candle 의미와 recorded replay 비교 | canonicalizer 구현 전 |
 | TBD-D03 | 잔여 `MISSING`이 있는 4시간봉의 격리·허용 기준 | gap 길이·위치별 feature/label 영향과 복구 성공률 | bar builder 승인 전 |
 | TBD-D04 | reconstructed PIT availability model, 보수적 지연과 민감도 | live-captured 지연분포, REST 문서, source metadata와 provenance | 첫 역사 OHLCV backtest 전 |
-| TBD-U01 | 일 1회 v1 유니버스의 buffer, tie, 결측·불완전 데이터 처리와 민감도 | 고정된 30일·약 30종목·상장 90일 기준 주변의 turnover, capacity, PIT 재현성 비교 | outer 평가 전; 고정 기준 변경은 Blueprint/ADR 검토 |
+| TBD-U01 | analysis universe와 execution shortlist의 tie, 결측·불완전 데이터 처리 및 `top_n` 민감도 | 30일 lookback·초기 `top_n=100`·향후 상장 90일 기준 주변의 turnover, capacity, PIT 재현성 비교 | outer 평가 전; 기준 변경은 Blueprint/ADR 검토 |
 | TBD-V01 | rolling/expanding window, 학습·OOS 길이와 step | 최소 레짐·label 수, 연속 OOS coverage, drift와 추정분산 trade-off, 모의 누출검사 | 첫 outer 실행 전 |
 | TBD-V02 | purging interval과 embargo 길이 | 실제 label interval, 최대 horizon, 실행 지연, feature 정보수명과 민감도 | 첫 outer 실행 전 |
 | TBD-V03 | CPCV group/path, CSCV 후보행렬·PBO 구성과 `not estimable` 최소 조건 | purge 후 표본·경로, 고정 후보 수, path coverage와 후보 의존성 | secondary 평가 전 |
