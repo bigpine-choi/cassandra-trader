@@ -2,7 +2,7 @@
 
 업비트 KRW 현물시장을 대상으로 하는 Long/Cash 기반 알고리즘 자동매매 시스템입니다.
 
-현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, point-in-time 마켓 목록·canonical 1분봉·완결 4시간봉을 조회하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
+현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, point-in-time 마켓 목록·catalog eligibility·canonical 1분봉·완결 4시간봉을 조회하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
 
 ## 프로젝트 목표
 
@@ -27,7 +27,8 @@
 - [x] point-in-time resolved minute slot 기반 UTC 4시간봉 파생
 - [x] 공개 WebSocket ticker·1분봉 수신, 재연결과 REST reconciliation
 - [x] append-only complete snapshot 기반 point-in-time 마켓 유니버스
-- [ ] warning·freshness·유동성을 결합한 투자 적격성 정책
+- [x] point-in-time snapshot freshness와 warning 기반 catalog eligibility gate
+- [ ] 30일 유동성·상장 이력·top-N을 결합한 최종 투자 후보 정책
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
 - [ ] 주문·체결·대사 시스템
@@ -74,9 +75,16 @@ uv run cassandra-trader capture-universe --database candles.db
 uv run cassandra-trader universe-as-of \
   --as-of 2026-08-23T12:00:00Z \
   --database candles.db
+
+uv run cassandra-trader eligible-markets \
+  --as-of 2026-08-23T12:00:00Z \
+  --maximum-snapshot-age-seconds 3600 \
+  --database candles.db
 ```
 
-point-in-time query는 `available_at <= as_of`인 complete 성공 snapshot만 사용합니다. 현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않으며 최초 성공 snapshot 이전은 `UNRESOLVED`입니다. snapshot은 raw warning metadata와 함께 append-only로 보존됩니다. warning 제외 및 freshness threshold는 후속 eligibility 정책이고, 공지사항 등 authoritative source를 이용한 과거 상장·폐지 이력 backfill은 아직 구현되지 않았습니다.
+point-in-time universe query는 `available_at <= as_of`인 complete 성공 snapshot만 사용합니다. catalog snapshot 계층은 당시 membership과 warning metadata를 보존하고, 별도 catalog eligibility 계층은 호출자가 명시한 maximum snapshot age와 warning 여부만 판정합니다. snapshot이 없거나 `as_of - observed_at`이 maximum age를 초과하면 전체 결과를 `UNRESOLVED`로 fail-closed하고, fresh snapshot의 warning market만 `EXCLUDED`합니다. `ELIGIBLE`은 최종 매수 대상이 아니라 후속 유동성 심사 전 후보입니다.
+
+현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 최근 30일 유동성, 상장 후 90일, 최종 top-N 선정과 authoritative 과거 상장·폐지 이력 backfill은 아직 구현되지 않았습니다.
 
 여러 KRW 마켓의 동일한 UTC `[start, end)` 구간을 순차 백필:
 

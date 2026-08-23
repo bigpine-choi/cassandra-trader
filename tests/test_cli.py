@@ -39,6 +39,12 @@ from cassandra_trader.domain.market import (
     MarketUniverseStatus,
     TradingPair,
 )
+from cassandra_trader.domain.market_eligibility import (
+    MARKET_ELIGIBILITY_POLICY_NAME,
+    MARKET_ELIGIBILITY_POLICY_VERSION,
+    MarketEligibilityResult,
+    evaluate_market_eligibility,
+)
 from cassandra_trader.domain.public_stream import StreamType, TickerEvent
 
 
@@ -309,6 +315,262 @@ def test_universe_as_of_rejects_invalid_arguments_before_query(
         )
 
     assert called is False
+
+
+def test_eligible_markets_outputs_sorted_resolved_json_lines_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    as_of = datetime(2026, 8, 23, 13, 0, tzinfo=UTC)
+    observed_at = as_of - timedelta(minutes=30)
+    available_at = observed_at + timedelta(seconds=1)
+    database = tmp_path / "catalog.db"
+
+    def fake_evaluate(
+        quote_currency: str,
+        cutoff: datetime,
+        database_path: str | Path,
+        maximum_snapshot_age: timedelta,
+    ) -> MarketEligibilityResult:
+        assert quote_currency == "KRW"
+        assert cutoff == as_of
+        assert database_path == database
+        assert maximum_snapshot_age == timedelta(seconds=3600)
+        universe = MarketUniverseResult(
+            status=MarketUniverseStatus.AVAILABLE,
+            quote_currency="KRW",
+            as_of=as_of,
+            snapshot_id="snapshot-1",
+            observed_at=observed_at,
+            available_at=available_at,
+            content_hash="c" * 64,
+            pairs=(
+                TradingPair("KRW-ADA", "에이다", "Cardano", True),
+                TradingPair("KRW-BTC", "비트코인", "Bitcoin", False),
+            ),
+        )
+        return evaluate_market_eligibility(universe, maximum_snapshot_age)
+
+    def unexpected_network(*args, **kwargs):
+        raise AssertionError("eligible-markets must not call the network")
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_eligibility_as_of",
+        fake_evaluate,
+    )
+    monkeypatch.setattr("cassandra_trader.cli.fetch_krw_trading_pairs", unexpected_network)
+    monkeypatch.setattr("cassandra_trader.cli.capture_krw_market_catalog", unexpected_network)
+
+    exit_code = main(
+        [
+            "eligible-markets",
+            "--as-of",
+            "2026-08-23T13:00:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+            "--database",
+            str(database),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 0
+    assert lines == [
+        {
+            "type": "market",
+            "market": "KRW-ADA",
+            "status": "EXCLUDED",
+            "reasons": ["WARNING"],
+            "is_warning": True,
+        },
+        {
+            "type": "market",
+            "market": "KRW-BTC",
+            "status": "ELIGIBLE",
+            "reasons": [],
+            "is_warning": False,
+        },
+        {
+            "type": "summary",
+            "status": "RESOLVED",
+            "reasons": [],
+            "policy_name": MARKET_ELIGIBILITY_POLICY_NAME,
+            "policy_version": MARKET_ELIGIBILITY_POLICY_VERSION,
+            "quote_currency": "KRW",
+            "as_of": "2026-08-23T13:00:00Z",
+            "maximum_snapshot_age_seconds": 3600,
+            "snapshot_id": "snapshot-1",
+            "observed_at": "2026-08-23T12:30:00Z",
+            "available_at": "2026-08-23T12:30:01Z",
+            "content_hash": "c" * 64,
+            "snapshot_age_seconds": 1800,
+            "candidate_count": 2,
+            "eligible_count": 1,
+            "excluded_count": 1,
+            "unresolved_count": 0,
+        },
+    ]
+
+
+def test_eligible_markets_unresolved_outputs_summary_only_and_exit_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    as_of = datetime(2026, 8, 23, 11, 59, 59, tzinfo=UTC)
+
+    def fake_evaluate(*args, **kwargs) -> MarketEligibilityResult:
+        universe = MarketUniverseResult(
+            status=MarketUniverseStatus.UNRESOLVED,
+            quote_currency="KRW",
+            as_of=as_of,
+            snapshot_id=None,
+            observed_at=None,
+            available_at=None,
+            content_hash=None,
+            pairs=(),
+        )
+        return evaluate_market_eligibility(universe, timedelta(seconds=60))
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_eligibility_as_of",
+        fake_evaluate,
+    )
+
+    exit_code = main(
+        [
+            "eligible-markets",
+            "--as-of",
+            "2026-08-23T11:59:59Z",
+            "--maximum-snapshot-age-seconds",
+            "60",
+            "--database",
+            str(tmp_path / "catalog.db"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {
+            "type": "summary",
+            "status": "UNRESOLVED",
+            "reasons": ["UNIVERSE_UNRESOLVED"],
+            "policy_name": MARKET_ELIGIBILITY_POLICY_NAME,
+            "policy_version": MARKET_ELIGIBILITY_POLICY_VERSION,
+            "quote_currency": "KRW",
+            "as_of": "2026-08-23T11:59:59Z",
+            "maximum_snapshot_age_seconds": 60,
+            "snapshot_id": None,
+            "observed_at": None,
+            "available_at": None,
+            "content_hash": None,
+            "snapshot_age_seconds": None,
+            "candidate_count": 0,
+            "eligible_count": 0,
+            "excluded_count": 0,
+            "unresolved_count": 0,
+        }
+    ]
+
+
+def test_eligible_markets_stale_universe_outputs_unresolved_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    as_of = datetime(2026, 8, 23, 13, 0, tzinfo=UTC)
+
+    def fake_evaluate(*args, **kwargs) -> MarketEligibilityResult:
+        universe = MarketUniverseResult(
+            status=MarketUniverseStatus.AVAILABLE,
+            quote_currency="KRW",
+            as_of=as_of,
+            snapshot_id="snapshot-stale",
+            observed_at=as_of - timedelta(hours=2),
+            available_at=as_of - timedelta(hours=2) + timedelta(seconds=1),
+            content_hash="d" * 64,
+            pairs=(TradingPair("KRW-ADA", "에이다", "Cardano", True),),
+        )
+        return evaluate_market_eligibility(universe, timedelta(hours=1))
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_eligibility_as_of",
+        fake_evaluate,
+    )
+
+    exit_code = main(
+        [
+            "eligible-markets",
+            "--as-of",
+            "2026-08-23T13:00:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+            "--database",
+            str(tmp_path / "catalog.db"),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 2
+    assert lines[0] == {
+        "type": "market",
+        "market": "KRW-ADA",
+        "status": "UNRESOLVED",
+        "reasons": ["STALE_UNIVERSE"],
+        "is_warning": True,
+    }
+    assert lines[1]["status"] == "UNRESOLVED"
+    assert lines[1]["reasons"] == ["STALE_UNIVERSE"]
+    assert lines[1]["candidate_count"] == 1
+    assert lines[1]["eligible_count"] == 0
+    assert lines[1]["excluded_count"] == 0
+    assert lines[1]["unresolved_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--as-of", "2026-08-23T12:00:00", "--maximum-snapshot-age-seconds", "60"],
+        ["--as-of", "2026-08-23T21:00:00+09:00", "--maximum-snapshot-age-seconds", "60"],
+        ["--as-of", "2026-08-23T12:00:00Z", "--maximum-snapshot-age-seconds", "0"],
+        ["--as-of", "2026-08-23T12:00:00Z", "--maximum-snapshot-age-seconds", "-1"],
+        [
+            "--as-of",
+            "2026-08-23T12:00:00Z",
+            "--maximum-snapshot-age-seconds",
+            "86400000000000",
+        ],
+    ],
+)
+def test_eligible_markets_rejects_invalid_arguments_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    def unexpected_query(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_eligibility_as_of",
+        unexpected_query,
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "eligible-markets",
+                *arguments,
+                "--database",
+                str(tmp_path / "catalog.db"),
+            ]
+        )
+
+    assert called is False
+    assert not (tmp_path / "catalog.db").exists()
 
 
 def test_candles_command(
