@@ -240,7 +240,7 @@ versioned liquidity top-N policy는 완결된 upstream ordinal rank와 호출자
 - catalog universe: Upbit KRW 전체 market을 snapshot과 데이터 수집 대상으로 삼고 warning market의 사실 데이터와 metadata도 보존한다.
 - analysis universe: fresh catalog의 non-warning market 전체다. 향후 feature, 시장 폭, 모멘텀, 변동성, 횡단면 분석은 liquidity top-N으로 축소하지 않고 이 전체 집합을 사용한다.
 - execution candidate universe: point-in-time 30일 유동성 rank의 명시적 top-N shortlist다. 초기 운영 목표는 `top_n=100`이며 domain·application 상수로 고정하지 않고 CLI와 실행 설정에서 전달한다.
-- portfolio: execution candidate 중 기존 정책에 따라 최대 6개 보유를 목표로 하지만 signal·portfolio·execution은 아직 구현되지 않았다.
+- portfolio: execution candidate 중 실제 보유 종목 수는 고정하지 않고 비용 차감 엣지·불확실성·유동성·포트폴리오 분산효과로 결정하지만 signal·portfolio·execution은 아직 구현되지 않았다.
 
 Top 100도 최종 매수 신호가 아니며 후보가 100개보다 적으면 억지로 채우지 않는다. 상장 후 90일 정책과 authoritative listing history가 구현되기 전에는 이 shortlist를 최종 투자 universe로 해석하지 않는다.
 
