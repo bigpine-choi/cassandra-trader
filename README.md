@@ -2,7 +2,7 @@
 
 업비트 KRW 현물시장을 대상으로 하는 Long/Cash 기반 알고리즘 자동매매 시스템입니다.
 
-현재 버전은 API 키 없이 업비트 공개 시장 데이터를 조회하는 초기 개발 단계이며, 실제 주문은 실행하지 않습니다.
+현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, canonical 1분봉과 완결 4시간봉을 조회하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
 
 ## 프로젝트 목표
 
@@ -20,7 +20,11 @@
 - [x] 공식 Upbit Python SDK 연동
 - [x] 업비트 KRW 거래 페어 조회
 - [x] 업비트 응답과 내부 도메인 모델 분리
-- [ ] canonical 1분봉 수집·정규화 및 완결 4시간봉 파생
+- [x] REST 1분봉 raw 응답과 immutable canonical revision의 SQLite 저장
+- [x] 단일 마켓 구간 백필과 `as_of` canonical 조회
+- [x] 명시적 복수 KRW 마켓의 순차 백필, 종목별 coverage와 JSONL 결과
+- [x] canonical 1분봉 기반 완결 UTC 4시간봉 파생
+- [x] 공개 WebSocket ticker·1분봉 수신, 재연결과 REST reconciliation
 - [ ] point-in-time 투자 유니버스
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
@@ -60,12 +64,41 @@ uv run cassandra-trader markets --limit 10
 
 이 명령은 인증이 필요 없는 읽기 전용 공개 API만 사용하며 주문을 생성하지 않습니다.
 
+여러 KRW 마켓의 동일한 UTC `[start, end)` 구간을 순차 백필:
+
+```bash
+uv run cassandra-trader backfill-dataset \
+  KRW-BTC KRW-ETH KRW-XRP \
+  --start 2026-08-22T08:00:00Z \
+  --end 2026-08-22T16:00:00Z \
+  --database candles.db
+```
+
+입력 마켓은 trim·대문자화 후 중복 제거·사전순 처리됩니다. 각 마켓의 백필 통계와 `[start, end)` canonical coverage를 JSON Lines로 출력하고, 마지막 줄에 전체 summary를 출력합니다. 일부 마켓이 실패해도 다음 마켓을 계속 처리하며 최종 종료 코드는 0이 아닙니다. `absent_slots`는 관측되지 않은 분 수만 나타내며 무거래 또는 장애를 판정하거나 분봉을 합성하지 않습니다.
+
+단일 마켓 백필과 완결 4시간봉 조회:
+
+```bash
+uv run cassandra-trader backfill-candles \
+  KRW-BTC \
+  --start 2026-08-22T08:00:00Z \
+  --end 2026-08-22T16:00:00Z \
+  --database candles.db
+
+uv run cassandra-trader four-hour-bar \
+  KRW-BTC \
+  --start 2026-08-22T08:00:00Z \
+  --as-of 2026-08-22T16:10:00Z \
+  --database candles.db
+```
+
 ## 코드 품질 검사
 
 ```bash
 uv run ruff format --check src tests
 uv run ruff check .
-uv run pytest
+uv run pytest -q
+git diff --check
 ```
 
 ## 설계 문서

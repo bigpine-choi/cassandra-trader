@@ -125,6 +125,21 @@ class StoredMinuteCandle:
     available_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalMinuteCandleCoverage:
+    """Logical canonical minute coverage for one half-open UTC range."""
+
+    market: str
+    requested_start: datetime
+    requested_end: datetime
+    as_of: datetime
+    expected_slots: int
+    observed_slots: int
+    absent_slots: int
+    earliest_candle_time: datetime | None
+    latest_candle_time: datetime | None
+
+
 class SqliteMinuteCandleRepository:
     """Persist raw observations and immutable canonical candle revisions."""
 
@@ -384,6 +399,53 @@ class SqliteMinuteCandleRepository:
 
         return tuple(_stored_candle(row) for row in rows)
 
+    def get_canonical_minute_candle_coverage(
+        self,
+        market: str,
+        start_time_utc: datetime,
+        end_time_utc: datetime,
+        as_of: datetime,
+    ) -> CanonicalMinuteCandleCoverage:
+        """Summarize logical canonical slots available as of one UTC cutoff."""
+
+        _validate_minute_range(start_time_utc, end_time_utc)
+        start_text = _utc_text(start_time_utc)
+        end_text = _utc_text(end_time_utc)
+        as_of_text = _utc_text(as_of)
+        expected_slots = int((end_time_utc - start_time_utc) // timedelta(minutes=1))
+        row = self._connection.execute(
+            """
+            SELECT COUNT(DISTINCT start_time_utc) AS observed_slots,
+                   MIN(start_time_utc) AS earliest_candle_time,
+                   MAX(start_time_utc) AS latest_candle_time
+            FROM canonical_minute_candles
+            WHERE market = ?
+              AND start_time_utc >= ?
+              AND start_time_utc < ?
+              AND available_at <= ?
+            """,
+            (market, start_text, end_text, as_of_text),
+        ).fetchone()
+        observed_slots = int(row["observed_slots"])
+
+        return CanonicalMinuteCandleCoverage(
+            market=market,
+            requested_start=start_time_utc,
+            requested_end=end_time_utc,
+            as_of=as_of,
+            expected_slots=expected_slots,
+            observed_slots=observed_slots,
+            absent_slots=expected_slots - observed_slots,
+            earliest_candle_time=(
+                None
+                if row["earliest_candle_time"] is None
+                else _parse_utc(row["earliest_candle_time"])
+            ),
+            latest_candle_time=(
+                None if row["latest_candle_time"] is None else _parse_utc(row["latest_candle_time"])
+            ),
+        )
+
     def _migrate(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
 
@@ -515,6 +577,20 @@ def _utc_text(value: datetime) -> str:
         raise ValueError("timestamps must be timezone-aware UTC")
 
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _validate_minute_range(start: datetime, end: datetime) -> None:
+    _utc_text(start)
+    _utc_text(end)
+
+    if start.second != 0 or start.microsecond != 0:
+        raise ValueError("start_time_utc must align to a one-minute UTC boundary")
+
+    if end.second != 0 or end.microsecond != 0:
+        raise ValueError("end_time_utc must align to a one-minute UTC boundary")
+
+    if start >= end:
+        raise ValueError("start_time_utc must be before end_time_utc")
 
 
 def _parse_utc(value: str) -> datetime:

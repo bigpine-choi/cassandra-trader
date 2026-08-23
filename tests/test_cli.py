@@ -19,6 +19,12 @@ from cassandra_trader.apps.minute_reconciliation import (
     MinuteReconciliationResult,
     MinuteReconciliationStatus,
 )
+from cassandra_trader.apps.multi_market_dataset import (
+    DatasetBackfillResult,
+    DatasetBackfillSummary,
+    DatasetMarketResult,
+    DatasetMarketStatus,
+)
 from cassandra_trader.cli import main
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.four_hour_bar import (
@@ -267,6 +273,145 @@ def test_backfill_candles_rejects_invalid_range(
                 str(tmp_path / "cassandra.db"),
             ]
         )
+
+
+def test_backfill_dataset_outputs_sorted_json_lines_and_failure_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    from cassandra_trader.adapters.storage.sqlite import CanonicalMinuteCandleCoverage
+
+    start = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
+    end = start + timedelta(hours=8)
+    observed_at = datetime(2026, 8, 23, tzinfo=UTC)
+    coverage = CanonicalMinuteCandleCoverage(
+        market="KRW-XRP",
+        requested_start=start,
+        requested_end=end,
+        as_of=observed_at,
+        expected_slots=480,
+        observed_slots=479,
+        absent_slots=1,
+        earliest_candle_time=start,
+        latest_candle_time=end - timedelta(minutes=1),
+    )
+    backfill = MinuteCandleBackfillResult(
+        pages_fetched=3,
+        raw_received=479,
+        canonical_new=479,
+        canonical_revised=0,
+        canonical_unchanged=0,
+        earliest_candle_time=start,
+        latest_candle_time=end - timedelta(minutes=1),
+        requested_start=start,
+        requested_end=end,
+    )
+
+    async def fake_backfill_multi_market_dataset(markets, requested_start, requested_end, db):
+        assert markets == ["KRW-XRP", "KRW-BTC", "KRW-XRP"]
+        assert requested_start == start
+        assert requested_end == end
+        assert db == tmp_path / "candles.db"
+        return DatasetBackfillResult(
+            markets=(
+                DatasetMarketResult(
+                    market="KRW-BTC",
+                    status=DatasetMarketStatus.FAILED,
+                    backfill=None,
+                    coverage=None,
+                    error_type="TimeoutError",
+                    error_message="request timed out",
+                ),
+                DatasetMarketResult(
+                    market="KRW-XRP",
+                    status=DatasetMarketStatus.SUCCEEDED,
+                    backfill=backfill,
+                    coverage=coverage,
+                    error_type=None,
+                    error_message=None,
+                ),
+            ),
+            summary=DatasetBackfillSummary(
+                requested_start=start,
+                requested_end=end,
+                observed_at=observed_at,
+                coverage_as_of=observed_at,
+                total=2,
+                succeeded=1,
+                failed=1,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.backfill_multi_market_dataset",
+        fake_backfill_multi_market_dataset,
+    )
+
+    exit_code = main(
+        [
+            "backfill-dataset",
+            "KRW-XRP",
+            "krw-btc",
+            "KRW-XRP",
+            "--start",
+            "2026-08-22T08:00:00Z",
+            "--end",
+            "2026-08-22T16:00:00Z",
+            "--database",
+            str(tmp_path / "candles.db"),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 1
+    assert [line["type"] for line in lines] == ["market", "market", "summary"]
+    assert [line.get("market") for line in lines] == ["KRW-BTC", "KRW-XRP", None]
+    assert lines[0]["status"] == "FAILED"
+    assert lines[0]["error"] == {"type": "TimeoutError", "message": "request timed out"}
+    assert lines[1]["backfill"]["canonical_new"] == 479
+    assert lines[1]["coverage"]["absent_slots"] == 1
+    assert lines[2]["failed"] == 1
+    assert lines[2]["requested_start"] == "2026-08-22T08:00:00Z"
+    assert lines[2]["requested_end"] == "2026-08-22T16:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["BTC-USDT", "--start", "2026-08-22T08:00:00Z", "--end", "2026-08-22T09:00:00Z"],
+        ["KRW-BTC", "--start", "2026-08-22T08:00:00", "--end", "2026-08-22T09:00:00Z"],
+        ["KRW-BTC", "--start", "2026-08-22T09:00:00Z", "--end", "2026-08-22T08:00:00Z"],
+    ],
+)
+def test_backfill_dataset_rejects_invalid_arguments_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    async def unexpected_call(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.backfill_multi_market_dataset",
+        unexpected_call,
+        raising=False,
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "backfill-dataset",
+                *arguments,
+                "--database",
+                str(tmp_path / "candles.db"),
+            ]
+        )
+
+    assert called is False
 
 
 def test_four_hour_bar_complete_output(

@@ -383,3 +383,106 @@ def test_as_of_range_query_returns_minutes_in_start_order(tmp_path: Path) -> Non
         )
 
     assert [item.candle.start_time_utc for item in stored] == sorted(starts)
+
+
+def test_canonical_coverage_counts_logical_minutes_as_of_revision_time(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cassandra.db"
+    second_start = _START + timedelta(minutes=1)
+    second = replace(
+        _candle(),
+        start_time_utc=second_start,
+        end_time_utc=second_start + timedelta(minutes=1),
+    )
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(
+            repository,
+            batch_id="batch-1",
+            records=(_record_for_candle(_candle(close="105"), 0),),
+            ingested_at=_RECEIVED + timedelta(seconds=1),
+        )
+        _ingest(
+            repository,
+            batch_id="batch-2",
+            records=(_record_for_candle(_candle(close="106"), 0),),
+            received_at=_RECEIVED + timedelta(minutes=1),
+            ingested_at=_RECEIVED + timedelta(minutes=1, seconds=1),
+        )
+        _ingest(
+            repository,
+            batch_id="batch-3",
+            records=(_record_for_candle(second, 0),),
+            received_at=_RECEIVED + timedelta(minutes=2),
+            ingested_at=_RECEIVED + timedelta(minutes=2, seconds=1),
+        )
+
+        before_second = repository.get_canonical_minute_candle_coverage(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=3),
+            _RECEIVED + timedelta(minutes=2),
+        )
+        after_second = repository.get_canonical_minute_candle_coverage(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=3),
+            _RECEIVED + timedelta(minutes=3),
+        )
+
+    assert before_second.expected_slots == 3
+    assert before_second.observed_slots == 1
+    assert before_second.absent_slots == 2
+    assert before_second.earliest_candle_time == _START
+    assert before_second.latest_candle_time == _START
+    assert after_second.expected_slots == 3
+    assert after_second.observed_slots == 2
+    assert after_second.absent_slots == 1
+    assert after_second.observed_slots + after_second.absent_slots == after_second.expected_slots
+    assert after_second.earliest_candle_time == _START
+    assert after_second.latest_candle_time == second_start
+
+
+def test_canonical_coverage_uses_exact_half_open_range_without_synthesizing(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cassandra.db"
+    before = replace(
+        _candle(),
+        start_time_utc=_START - timedelta(minutes=1),
+        end_time_utc=_START,
+    )
+    at_end = replace(
+        _candle(),
+        start_time_utc=_START + timedelta(minutes=3),
+        end_time_utc=_START + timedelta(minutes=4),
+    )
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(
+            repository,
+            batch_id="boundary-batch",
+            records=(
+                _record_for_candle(before, 0),
+                _record_for_candle(_candle(), 1),
+                _record_for_candle(at_end, 2),
+            ),
+        )
+        coverage = repository.get_canonical_minute_candle_coverage(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=3),
+            _RECEIVED + timedelta(minutes=1),
+        )
+        stored = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=3),
+            _RECEIVED + timedelta(minutes=1),
+        )
+
+    assert coverage.expected_slots == 3
+    assert coverage.observed_slots == 1
+    assert coverage.absent_slots == 2
+    assert len(stored) == 1
