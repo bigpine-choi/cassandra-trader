@@ -449,6 +449,7 @@ stateDiagram-v2
 | Liquidity Dataset Bootstrap | fresh non-warning analysis universe 전체의 정확한 30일 minute data 구축 | canonical·successful evidence 기반 재개, market별 순차 bounded backfill |
 | Liquidity Dataset Refresh | current catalog capture와 rolling 30일 incremental gap 갱신 | successful evidence complement·새 tail만 순차 bounded backfill, 과거 데이터 보존 |
 | Liquidity Evaluation | 30일 43,200 minute slot의 KRW quote volume과 결정론적 rank | 비영속 point-in-time 결과, 전체 후보 완결 시에만 rank |
+| Microstructure Capture | 고정된 point-in-time liquidity top-N의 공개 trade·orderbook bounded session | raw·normalized event·lifecycle·terminal evidence append-only, 재연결 구간 비합성 |
 | Canonical | 실시간 ticker, canonical 1분봉, 선별 trade·orderbook, market status | 스키마 버전·품질 플래그 |
 | Derived Bar | point-in-time minute slot에서 실제 거래 분봉만 집계한 4시간봉 | UTC 경계, slot 상태·구성 1분봉과 품질 계보 |
 | Feature | point-in-time 알파·레짐·위험 특징 | `as_of`, 코드·데이터 버전 |
@@ -470,6 +471,8 @@ trailing liquidity는 catalog-level `ELIGIBLE` market에만 정확한 UTC `[wind
 resumable bootstrap과 incremental refresh는 이 조회의 선행 데이터 구축 도구다. stale 또는 unresolved catalog는 candle 조회 전에 fail-closed하며, fresh all-warning catalog는 대상 0개의 정상 완료다. refresh는 current catalog capture 실패 시 candle 갱신을 시작하지 않는다. 하나의 public client와 SQLite repository를 재사용해 market·gap·page 순으로 처리하고, transient timeout·connection·HTTP 429·5xx만 bounded exponential backoff와 `Retry-After` 한도 안에서 retry한다. 실패한 market의 이미 저장된 canonical은 보존하지만 FAILED evidence로 absence를 확정하지 않는다. 자동 scheduler는 아직 구현되지 않았다.
 
 liquidity top-N은 이 point-in-time rank를 다시 계산하지 않고 그대로 재사용하는 read-only policy다. 결과와 JSONL은 market code 순서를 유지하고 정책·catalog·snapshot·window metadata를 보존한다. upstream 전체가 resolved일 때만 N 이내를 선별하며, unresolved upstream에는 selection이나 partial rank를 만들지 않는다. 초기 execution shortlist 설정은 명시적 `top_n=100`이고 코드에 하드코딩하지 않는다. 이 shortlist는 analysis universe를 제한하지 않으며 synthetic candle, forward-fill, 결과 영속화를 수행하지 않고 아직 signal·portfolio·execution에 연결하지 않는다.
+
+bounded microstructure recorder는 위 selection을 WebSocket 연결 전 정확히 한 번 평가하고 세션 중 고정한다. resolved selection의 선택 market에 한해 Upbit 공개 realtime trade와 orderbook 최초 snapshot·realtime을 한 연결에서 구독하며, 재연결 시 새 ticket으로 같은 대상을 재구독한다. raw frame은 receive ordinal과 SHA-256을 붙여 exact bytes로 보존하고 trade·순서가 있는 orderbook level 정규화 row와 한 transaction에 append한다. 중복 raw나 trade sequential ID는 metadata로 표시하되 관측 row를 삭제하지 않는다. capture 시작 이전 history와 disconnect 구간은 존재한다고 간주하지 않고, REST 복원·synthetic gap fill·orderbook completeness 판정을 하지 않는다. API key·Private API·계좌·주문은 사용하지 않으며 analysis universe 전체 수집이 아니다. 이 경로는 용량 측정용 run-once bounded recorder이며 24/7, retention, compression, cost model, signal·portfolio·execution 연결은 아직 없다.
 
 연구 데이터는 Parquet + DuckDB를 기본 제안으로 하고, 운영 주문·상태 원장은 PostgreSQL을 기본 제안으로 한다. Redis나 Kafka는 필요성이 입증되기 전에는 도입하지 않는다.
 
@@ -770,8 +773,8 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 |---|---|
 | 프로젝트 기반 | `pyproject.toml`, lockfile, Python 3.12 패키지와 CLI 진입점 |
 | Upbit REST | 공식 Upbit SDK를 사용한 인증 없는 KRW 마켓 카탈로그, 최근 완결 1분봉, 페이지 기반 `[start, end)` 과거 1분봉 조회 |
-| Upbit WebSocket | 공개 ticker·1분봉 정규화, 중복 제거, ping/pong, 지수 backoff와 jitter를 적용한 재연결·재구독 |
-| 저장 | SQLite ordered migration v3, append-only raw batch·record, immutable canonical revision, bounded backfill 실행 증거와 complete market catalog snapshot |
+| Upbit WebSocket | 공개 ticker·1분봉 정규화·중복 제거, 재연결·재구독, 고정 top-N 공개 trade·orderbook bounded capture |
+| 저장 | SQLite ordered migration v4, append-only raw batch·record, immutable canonical revision, bounded backfill 증거·complete catalog snapshot·microstructure session/raw/normalized/lifecycle/terminal evidence |
 | point-in-time 조회 | `[start, end)`와 `as_of` 기준 최신 canonical revision과 성공한 범위 증거를 결합한 `TRADED`·`NO_TRADE`·`UNRESOLVED` slot |
 | 마켓 유니버스 | 저장된 성공 snapshot만으로 `AVAILABLE`·`UNRESOLVED`를 판정하고 market code 순서 membership과 관측·가용 시각·content hash 제공 |
 | catalog eligibility | 선택된 point-in-time universe에 명시적 freshness 한계와 warning 정책을 적용해 `ELIGIBLE`·`EXCLUDED`·`UNRESOLVED` 판정, stale·snapshot 부재 시 fail-closed |
@@ -781,9 +784,10 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
 | 파생 봉 | point-in-time minute slot 240개를 resolve해 `COMPLETE`·`NO_TRADE`·`INCOMPLETE`를 구분하고, `COMPLETE`에는 실제 `TRADED` 분봉만 집계 |
 | 실시간 reconciliation | 기동 lookback과 각 완결 분에 REST를 다시 조회해 WebSocket 관측을 canonical 저장소와 대사하고 신규·수정·동일 revision을 구분 |
-| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity·top-N 평가, resumable bootstrap·incremental run-once refresh, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
+| microstructure recorder | resolved liquidity top-N을 한 번 고정하고 공개 trade·orderbook raw와 exact Decimal normalized event, lifecycle, terminal evidence를 bounded append-only 수집 |
+| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity·top-N 평가, resumable bootstrap·incremental run-once refresh, bounded microstructure capture, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
 | 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |
-| 미구현 | authoritative 과거 상장·폐지 이력 backfill, refresh 자동 scheduler, 별도 research dataset 파이프라인, 상장 후 90일을 결합한 최종 투자 universe, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
+| 미구현 | authoritative 과거 상장·폐지 이력 backfill, refresh 자동 scheduler, 별도 research dataset 파이프라인, 상장 후 90일을 결합한 최종 투자 universe, feature·label·모델·백테스트, 24/7 microstructure recorder·retention·compression·cost model, 실시간 위험 감시, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
 
 현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical, bounded backfill evidence와 market catalog snapshot만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. coverage의 `absent_slots` 자체는 중립적 관측 부재이고, 성공한 범위 증거와 결합된 resolver만 `NO_TRADE`를 판정한다.
 
@@ -826,7 +830,8 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 11. 완료: 완결된 point-in-time liquidity rank를 재사용하는 versioned top-N shortlist
 12. 완료: fresh non-warning analysis universe 전체의 resumable 30일 liquidity dataset bootstrap
 13. 완료: current catalog capture와 evidence complement 기반 rolling 30일 incremental run-once refresh
-14. 이후 로드맵: authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
+14. 완료: 고정된 point-in-time liquidity top-N 공개 trade·orderbook bounded append-only recorder
+15. 이후 로드맵: live smoke로 events/sec·SQLite MB/min을 측정한 뒤 장기 보존 정책을 정하고, authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
 
 이 top-N은 상장 이력 심사 전 liquidity shortlist다. 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 authoritative listing history와 상장 후 90일 심사, 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
 
@@ -837,6 +842,8 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 - [Upbit 개발자 센터](https://docs.upbit.com/kr)
 - [Upbit API Rate Limits](https://docs.upbit.com/kr/reference/rate-limits)
 - [Upbit WebSocket 가이드](https://docs.upbit.com/kr/reference/websocket-guide)
+- [Upbit WebSocket 체결](https://docs.upbit.com/kr/reference/websocket-trade)
+- [Upbit WebSocket 호가](https://docs.upbit.com/kr/reference/websocket-orderbook)
 - [주문 가능 정보 조회](https://docs.upbit.com/kr/reference/available-order-information)
 - [주문 생성 테스트](https://docs.upbit.com/kr/reference/order-test)
 - [공식 Upbit Python SDK](https://github.com/upbit-official/upbit-sdk-python)

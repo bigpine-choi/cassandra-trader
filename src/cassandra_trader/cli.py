@@ -34,6 +34,12 @@ from cassandra_trader.apps.market_universe import (
     capture_krw_market_catalog,
     resolve_market_universe_as_of,
 )
+from cassandra_trader.apps.microstructure_recorder import (
+    MicrostructureCaptureStatus,
+    capture_market_payload,
+    capture_summary_payload,
+    record_microstructure,
+)
 from cassandra_trader.apps.minute_candle_backfill import backfill_minute_candles
 from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
@@ -71,6 +77,20 @@ def _positive_timedelta_seconds(value: str) -> int:
     except OverflowError as error:
         raise argparse.ArgumentTypeError("value exceeds the supported duration range") from error
 
+    return number
+
+
+def _capture_duration_seconds(value: str) -> int:
+    number = _positive_timedelta_seconds(value)
+    if number > 86_400:
+        raise argparse.ArgumentTypeError("capture duration must not exceed 86400 seconds")
+    return number
+
+
+def _orderbook_units(value: str) -> int:
+    number = int(value)
+    if number not in (1, 5, 15, 30):
+        raise argparse.ArgumentTypeError("orderbook units must be one of 1, 5, 15, or 30")
     return number
 
 
@@ -325,6 +345,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="positive number of liquidity-ranked markets to shortlist",
     )
     liquidity_top_n.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    microstructure = commands.add_parser(
+        "record-microstructure",
+        help="record bounded public trades and orderbooks for a fixed point-in-time top-N",
+    )
+    microstructure.add_argument(
+        "--quote-currency",
+        type=_krw_quote_currency,
+        required=True,
+        help="quote currency (must be KRW)",
+    )
+    microstructure.add_argument(
+        "--window-end",
+        type=_liquidity_window_end,
+        required=True,
+        help="exclusive UTC minute boundary for the 30-day liquidity window",
+    )
+    microstructure.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC point-in-time selection cutoff",
+    )
+    microstructure.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    microstructure.add_argument(
+        "--top-n",
+        type=_positive_integer,
+        required=True,
+        help="positive number of liquidity-ranked markets to record",
+    )
+    microstructure.add_argument(
+        "--duration-seconds",
+        type=_capture_duration_seconds,
+        required=True,
+        help="bounded capture duration in seconds (1-86400)",
+    )
+    microstructure.add_argument(
+        "--orderbook-units",
+        type=_orderbook_units,
+        default=15,
+        help="orderbook depth unit: 1, 5, 15, or 30 (default: 15)",
+    )
+    microstructure.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -926,6 +999,50 @@ async def _refresh_liquidity_dataset(
     return 0
 
 
+async def _record_microstructure(
+    quote_currency: str,
+    window_end: datetime,
+    as_of: datetime,
+    maximum_snapshot_age_seconds: int,
+    top_n: int,
+    duration_seconds: int,
+    orderbook_units: int,
+    database: Path,
+) -> int:
+    try:
+        result = await record_microstructure(
+            quote_currency,
+            window_end,
+            as_of,
+            database,
+            timedelta(seconds=maximum_snapshot_age_seconds),
+            top_n,
+            timedelta(seconds=duration_seconds),
+            orderbook_units=orderbook_units,
+        )
+    except Exception as error:
+        print(
+            json.dumps(
+                {
+                    "type": "summary",
+                    "status": MicrostructureCaptureStatus.FAILED.value,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 1
+    for market in result.markets:
+        print(json.dumps(capture_market_payload(market), separators=(",", ":")))
+    print(json.dumps(capture_summary_payload(result), separators=(",", ":")))
+    if result.status is MicrostructureCaptureStatus.UNRESOLVED:
+        return 2
+    if result.status is MicrostructureCaptureStatus.FAILED:
+        return 1
+    return 0
+
+
 def _optional_utc_text(value: datetime | None) -> str:
     if value is None:
         return "None"
@@ -1176,6 +1293,22 @@ def main(argv: Sequence[str] | None = None) -> int | None:
             arguments.maximum_snapshot_age_seconds,
             arguments.top_n,
             arguments.database,
+        )
+
+    if arguments.command == "record-microstructure":
+        if arguments.as_of < arguments.window_end:
+            parser.error("record-microstructure: --as-of must not be before --window-end")
+        return asyncio.run(
+            _record_microstructure(
+                arguments.quote_currency,
+                arguments.window_end,
+                arguments.as_of,
+                arguments.maximum_snapshot_age_seconds,
+                arguments.top_n,
+                arguments.duration_seconds,
+                arguments.orderbook_units,
+                arguments.database,
+            )
         )
 
     if arguments.command == "bootstrap-liquidity-dataset":

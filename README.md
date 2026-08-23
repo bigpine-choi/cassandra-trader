@@ -2,7 +2,7 @@
 
 업비트 KRW 현물시장을 대상으로 하는 Long/Cash 기반 알고리즘 자동매매 시스템입니다.
 
-현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, point-in-time 마켓 목록·catalog eligibility·30일 유동성 순위·liquidity top-N shortlist·resumable bootstrap·incremental refresh·canonical 1분봉·완결 4시간봉을 제공하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
+현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, point-in-time 마켓 목록·catalog eligibility·30일 유동성 순위·liquidity top-N shortlist·resumable bootstrap·incremental refresh·canonical 1분봉·완결 4시간봉과 bounded 공개 체결·호가 recorder를 제공하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
 
 ## 프로젝트 목표
 
@@ -32,6 +32,7 @@
 - [x] 완결된 point-in-time liquidity rank 기반 versioned top-N shortlist
 - [x] fresh non-warning analysis universe 전체의 resumable 30일 minute dataset bootstrap
 - [x] current catalog capture와 successful evidence complement 기반 incremental run-once refresh
+- [x] 고정된 point-in-time liquidity top-N의 bounded 공개 trade·orderbook append-only recorder
 - [ ] authoritative 상장 이력·상장 후 90일을 결합한 최종 투자 후보 정책
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
@@ -111,6 +112,16 @@ uv run cassandra-trader refresh-liquidity-dataset \
   --quote-currency KRW \
   --maximum-snapshot-age-seconds 3600 \
   --database candles.db
+
+uv run cassandra-trader record-microstructure \
+  --quote-currency KRW \
+  --window-end 2026-08-24T12:00:00Z \
+  --as-of 2026-08-24T12:10:00Z \
+  --maximum-snapshot-age-seconds 3600 \
+  --top-n 100 \
+  --duration-seconds 60 \
+  --orderbook-units 15 \
+  --database candles.db
 ```
 
 point-in-time universe query는 `available_at <= as_of`인 complete 성공 snapshot만 사용합니다. catalog snapshot 계층은 당시 membership과 warning metadata를 보존하고, 별도 catalog eligibility 계층은 호출자가 명시한 maximum snapshot age와 warning 여부만 판정합니다. snapshot이 없거나 `as_of - observed_at`이 maximum age를 초과하면 전체 결과를 `UNRESOLVED`로 fail-closed하고, fresh snapshot의 warning market만 `EXCLUDED`합니다. `ELIGIBLE`은 최종 매수 대상이 아니라 후속 유동성 심사 전 후보입니다.
@@ -124,6 +135,8 @@ trailing liquidity는 fresh catalog eligibility를 통과한 non-warning KRW mar
 `bootstrap-liquidity-dataset`은 명시한 fresh point-in-time catalog의 non-warning analysis universe 전체에 정확한 UTC 30일·43,200분 범위를 순차 백필합니다. 실행 시작의 `resume_as_of`로 기존 `MinuteSlotSummary`를 확인해 모든 slot이 이미 resolved된 market은 API 호출 없이 `SKIPPED_COMPLETE`로 건너뜁니다. incomplete market은 작은 gap만 최적화하지 않고 동일한 전체 범위를 다시 조회하며 기존 canonical revision과 successful evidence를 checkpoint로 재사용합니다. 한 market의 최종 실패는 `FAILED`로 남기고 다음 market을 계속 처리합니다. 보수적 rate limit과 timeout·connection·HTTP 429·5xx 한정 retry를 적용하고 synthetic candle이나 forward-fill은 만들지 않습니다.
 
 `refresh-liquidity-dataset`은 run-once cycle마다 현재 KRW catalog를 새 snapshot으로 보존하고, source 관측 시점까지 완전히 종료된 마지막 UTC minute를 기준으로 rolling 30일 window를 정합니다. fresh non-warning market에서 기존 successful evidence가 덮지 않는 새 tail과 내부 gap만 시간순 bounded backfill하며, 전체 window가 canonical과 evidence로 이미 resolved됐으면 API 호출 없이 건너뜁니다. rolling window 밖의 과거 canonical과 evidence는 삭제하지 않습니다. bootstrap은 최초 전체 범위 구성과 안전 재개용이고 refresh는 이후 증분 갱신용입니다.
+
+`record-microstructure`는 시작 전 `evaluate_liquidity_top_n_as_of()`를 한 번만 평가해 fresh·resolved execution shortlist를 세션 전체에 고정하고, 선택된 market만의 공개 realtime trade와 orderbook snapshot·realtime frame을 지정한 기간 동안 기록합니다. analysis universe 전체를 대상으로 확장하지 않으며, API key·계좌·주문·Private WebSocket을 사용하지 않습니다. raw frame과 exact Decimal 정규화 event를 동일 transaction에 append하고 재연결마다 새 ticket으로 같은 고정 selection을 재구독하지만, capture 시작 이전 history나 disconnect 구간을 REST·synthetic event로 복원하지 않고 orderbook 완전성을 추측하지 않습니다. 아직 24/7 recorder, retention, compression, cost model 또는 signal·portfolio·execution 연결은 아니며, 실제 live smoke 후 events/sec와 SQLite MB/min을 측정해 장기 보존 정책을 정해야 합니다.
 
 현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 상장 후 90일 정책, authoritative 과거 상장·폐지 이력 backfill과 별도 research dataset 파이프라인은 아직 구현되지 않았습니다. refresh 자동 scheduler도 없으므로 명령을 cron/systemd 없이 명시적으로 실행해야 하며 signal, portfolio, execution에는 연결되지 않습니다.
 

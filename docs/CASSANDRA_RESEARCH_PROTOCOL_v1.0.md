@@ -187,8 +187,16 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
   정규화한다.
 - 완결 4시간봉은 완결·품질 판정된 canonical 1분봉을 UTC 경계로 집계한 파생 데이터다.
 - REST 240분봉을 유일한 원천으로 받아 저장하는 방식은 연구 기준 경로가 아니다.
-- 체결·호가는 전 종목을 무조건 상시 저장하지 않고 보유 종목, 상위 매수 후보와 현재 주문
-  대상을 중심으로 수집한다.
+- 현재 bounded microstructure recorder는 capture 시작 전 한 번 평가한 fresh resolved
+  liquidity top-N selection을 세션 종료까지 고정하고, 그 market의 공개 trade·orderbook만
+  수집한다. analysis universe 전체를 microstructure 대상으로 확장하지 않는다.
+- raw frame·normalized event·connection lifecycle·terminal evidence를 append-only로 보존하되,
+  capture 시작 이전 이력이나 disconnect 구간을 존재한다고 간주하지 않고 REST·synthetic
+  event로 복원하지 않으며 orderbook completeness를 추측하지 않는다.
+- 이 경로는 API key·Private WebSocket·계좌·주문을 사용하지 않는 run-once bounded
+  recorder다. 24/7 수집, retention, compression과 cost model은 live smoke에서
+  events/sec·SQLite MB/min을 측정한 뒤 별도로 정하며 signal·portfolio·execution에 연결하지
+  않는다.
 - 미완결 4시간봉은 정상 알파·레짐·포트폴리오 결정에 사용할 수 없다.
 - 위험·주문·체결·잔고 감시는 4시간 결정을 기다리지 않고 실시간 이벤트 경로에서 계속된다.
 
