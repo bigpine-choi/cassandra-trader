@@ -124,7 +124,7 @@ def test_normalizes_deduplicates_sorts_and_keeps_market_data_separate(
     assert len(btc) == len(xrp) == 2
 
 
-@pytest.mark.parametrize("markets", [[], ["BTC-USDT"], ["KRW-"]])
+@pytest.mark.parametrize("markets", [[], ["BTC-USDT"], ["KRW-"], ["KRW-비트"]])
 def test_rejects_empty_or_non_krw_markets_before_fetch(
     tmp_path: Path,
     markets: list[str],
@@ -157,6 +157,67 @@ def test_continues_after_one_market_failure_and_reports_neutral_absence(
     assert succeeded.coverage is not None
     assert succeeded.coverage.observed_slots == 2
     assert succeeded.coverage.absent_slots == 1
+    assert result.summary.succeeded == 1
+    assert result.summary.failed == 1
+
+
+def test_second_page_failure_keeps_partial_coverage_and_continues(
+    tmp_path: Path,
+) -> None:
+    end = _START + timedelta(minutes=201)
+    calls: list[str] = []
+    btc_calls = 0
+
+    async def fetch_page(
+        market: str,
+        count: int,
+        *,
+        as_of: datetime,
+        to: datetime,
+    ) -> MinuteCandleResponseBatch:
+        nonlocal btc_calls
+        assert count == 200
+        assert as_of == _OBSERVED_AT
+        calls.append(market)
+
+        if market == "KRW-BTC":
+            btc_calls += 1
+
+            if btc_calls == 2:
+                raise TimeoutError("second page timed out")
+
+            starts = (_START + timedelta(minutes=offset) for offset in range(1, 201))
+            return _batch(market, starts)
+
+        assert to == end
+        return _batch(market, (_START, end - timedelta(minutes=1)))
+
+    result = asyncio.run(
+        backfill_multi_market_dataset_with_fetcher(
+            ["KRW-XRP", "KRW-BTC"],
+            _START,
+            end,
+            tmp_path / "candles.db",
+            fetch_page=fetch_page,
+            observed_at=_OBSERVED_AT,
+            coverage_as_of=_COVERAGE_AS_OF,
+        )
+    )
+
+    failed, succeeded = result.markets
+    assert calls == ["KRW-BTC", "KRW-BTC", "KRW-XRP"]
+    assert failed.market == "KRW-BTC"
+    assert failed.status is DatasetMarketStatus.FAILED
+    assert failed.backfill is None
+    assert failed.coverage is not None
+    assert failed.coverage.expected_slots == 201
+    assert failed.coverage.observed_slots == 200
+    assert failed.coverage.absent_slots == 1
+    assert failed.error_type == "TimeoutError"
+    assert failed.error_message == "second page timed out"
+    assert succeeded.market == "KRW-XRP"
+    assert succeeded.status is DatasetMarketStatus.SUCCEEDED
+    assert succeeded.backfill is not None
     assert result.summary.succeeded == 1
     assert result.summary.failed == 1
 

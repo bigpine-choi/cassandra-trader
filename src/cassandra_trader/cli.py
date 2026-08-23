@@ -62,7 +62,13 @@ def _market_code(value: str) -> str:
     normalized = value.strip().upper()
     quote, separator, base = normalized.partition("-")
 
-    if not separator or not quote.isalnum() or not base.isalnum():
+    if (
+        not separator
+        or not quote.isascii()
+        or not quote.isalnum()
+        or not base.isascii()
+        or not base.isalnum()
+    ):
         raise argparse.ArgumentTypeError("market must look like KRW-BTC")
 
     return normalized

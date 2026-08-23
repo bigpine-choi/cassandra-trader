@@ -244,7 +244,13 @@ def normalize_krw_markets(markets: Iterable[str]) -> tuple[str, ...]:
     for market in normalized:
         quote, separator, base = market.partition("-")
 
-        if separator != "-" or quote != "KRW" or not base or not base.isalnum():
+        if (
+            separator != "-"
+            or quote != "KRW"
+            or not base
+            or not base.isascii()
+            or not base.isalnum()
+        ):
             raise ValueError(f"market must be an Upbit KRW market: {market}")
 
     return tuple(sorted(normalized))

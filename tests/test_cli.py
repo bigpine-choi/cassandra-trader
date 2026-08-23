@@ -132,6 +132,29 @@ def test_candles_command_rejects_invalid_arguments(arguments: list[str]) -> None
         main(arguments)
 
 
+@pytest.mark.parametrize("market", ["KRW-비트", "ＫＲＷ-BTC"])
+def test_candles_command_rejects_unicode_market_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    market: str,
+) -> None:
+    called = False
+
+    async def unexpected_call(*args, **kwargs):
+        nonlocal called
+        called = True
+        return ()
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.fetch_recent_minute_candles",
+        unexpected_call,
+    )
+
+    with pytest.raises(SystemExit):
+        main(["candles", market, "--count", "1"])
+
+    assert called is False
+
+
 def test_sync_candles_command(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
