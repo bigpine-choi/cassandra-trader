@@ -1,38 +1,49 @@
-name: CI
+name: Quality
 
 on:
   pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   quality:
-    name: Python 3.12 quality checks
+    name: Quality checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-      - name: Install uv
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.12.5"
           enable-cache: true
+          cache-dependency-glob: uv.lock
 
-      - name: Install Python
-        run: uv python install 3.12
-
-      - name: Sync dependencies
+      - name: Install dependencies
         run: uv sync --locked --all-groups
 
       - name: Check formatting
@@ -42,4 +53,60 @@ jobs:
         run: uv run --frozen ruff check .
 
       - name: Run tests
-        run: uv run --frozen pytest
+        run: uv run --frozen pytest -q
+
+      - name: Check whitespace
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          ensure_commit() {
+            local commit_sha="$1"
+            if ! git cat-file -e "${commit_sha}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$commit_sha"
+            fi
+          }
+
+          previous_or_empty_tree() {
+            local commit_sha="$1"
+            if git rev-parse --verify "${commit_sha}^" >/dev/null 2>&1; then
+              printf '%s^\n' "$commit_sha"
+            else
+              git hash-object -t tree /dev/null
+            fi
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              base_sha="$PR_BASE_SHA"
+              head_sha="$PR_HEAD_SHA"
+              ensure_commit "$base_sha"
+              ensure_commit "$head_sha"
+              ;;
+            push)
+              head_sha="$CURRENT_SHA"
+              ensure_commit "$head_sha"
+              if [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                base_sha="$(previous_or_empty_tree "$head_sha")"
+              else
+                base_sha="$PUSH_BEFORE_SHA"
+                ensure_commit "$base_sha"
+              fi
+              ;;
+            workflow_dispatch)
+              head_sha="$CURRENT_SHA"
+              ensure_commit "$head_sha"
+              base_sha="$(previous_or_empty_tree "$head_sha")"
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          git diff --check "$base_sha" "$head_sha"
