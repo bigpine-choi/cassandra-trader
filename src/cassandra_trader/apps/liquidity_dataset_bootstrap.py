@@ -270,7 +270,7 @@ class _Attempt:
     error: Exception | None
 
 
-class _ResilientFetcher:
+class ResilientMinuteCandleFetcher:
     def __init__(
         self,
         fetch_page: FetchMinuteCandlePage,
@@ -352,13 +352,13 @@ async def bootstrap_liquidity_dataset(
             adapter = UpbitPublicDataAdapter(
                 list_minute_candles=client.candles.list_minutes,
             )
-            fetcher = _ResilientFetcher(
+            fetcher = ResilientMinuteCandleFetcher(
                 adapter.fetch_minute_candle_batch,
                 policy,
                 sleep=sleep,
                 monotonic=monotonic or time.monotonic,
                 clock=effective_clock,
-                retry_decider=retry_decider or _is_transient_error,
+                retry_decider=retry_decider or is_transient_minute_candle_error,
             )
             return await _run_bootstrap(
                 request,
@@ -402,13 +402,13 @@ async def bootstrap_liquidity_dataset_with_fetcher(
         early_result = _early_result(request, eligibility)
         if early_result is not None:
             return early_result
-        fetcher = _ResilientFetcher(
+        fetcher = ResilientMinuteCandleFetcher(
             fetch_page,
             policy,
             sleep=sleep,
             monotonic=monotonic or time.monotonic,
             clock=effective_clock,
-            retry_decider=retry_decider or _is_transient_error,
+            retry_decider=retry_decider or is_transient_minute_candle_error,
         )
         return await _run_bootstrap(
             request,
@@ -723,7 +723,7 @@ def _validated_request(
     )
 
 
-def _is_transient_error(error: Exception) -> bool:
+def is_transient_minute_candle_error(error: Exception) -> bool:
     if isinstance(error, (TimeoutError, ConnectionError, APIConnectionError)):
         return True
     return isinstance(error, APIStatusError) and (

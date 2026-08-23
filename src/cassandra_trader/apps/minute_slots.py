@@ -62,10 +62,11 @@ def resolve_minute_slots_from_repository(
         as_of,
         status=MinuteCandleBackfillRunStatus.SUCCEEDED,
     )
-    successful_intervals = _merge_successful_intervals(
+    successful_intervals = fully_covered_minute_evidence_intervals(
         successful_runs,
         start_time_utc,
         end_time_utc,
+        as_of,
     )
     slots: list[ResolvedMinuteSlot] = []
     slot_start = start_time_utc
@@ -172,15 +173,11 @@ def summarize_minute_slots_from_repository(
         as_of,
         status=MinuteCandleBackfillRunStatus.SUCCEEDED,
     )
-    merged = _merge_successful_intervals(
+    fully_covered = fully_covered_minute_evidence_intervals(
         successful_runs,
         start_time_utc,
         end_time_utc,
-    )
-    fully_covered = tuple(
-        (full_start, full_end)
-        for interval_start, interval_end in merged
-        if (full_start := _ceil_minute(interval_start)) < (full_end := _floor_minute(interval_end))
+        as_of,
     )
     covered_count = sum(
         int((interval_end - interval_start) // timedelta(minutes=1))
@@ -210,31 +207,53 @@ def summarize_minute_slots_from_repository(
     )
 
 
-def _merge_successful_intervals(
+def fully_covered_minute_evidence_intervals(
     runs: tuple[StoredMinuteCandleBackfillRun, ...],
     requested_start: datetime,
     requested_end: datetime,
+    as_of: datetime,
 ) -> tuple[tuple[datetime, datetime], ...]:
+    """Clip and merge successful evidence into fully covered minute ranges."""
+
+    _validate_range(requested_start, requested_end)
+    _validate_utc(as_of, "as_of")
     clipped = sorted(
         (
             max(run.requested_start, requested_start),
             min(run.requested_end, run.observed_at, requested_end),
         )
         for run in runs
-        if max(run.requested_start, requested_start)
+        if run.status is MinuteCandleBackfillRunStatus.SUCCEEDED
+        and run.available_at <= as_of
+        and max(run.requested_start, requested_start)
         < min(run.requested_end, run.observed_at, requested_end)
     )
-    merged: list[tuple[datetime, datetime]] = []
+    merged_raw: list[tuple[datetime, datetime]] = []
 
     for interval_start, interval_end in clipped:
-        if not merged or interval_start > merged[-1][1]:
-            merged.append((interval_start, interval_end))
+        if not merged_raw or interval_start > merged_raw[-1][1]:
+            merged_raw.append((interval_start, interval_end))
             continue
 
-        previous_start, previous_end = merged[-1]
-        merged[-1] = (previous_start, max(previous_end, interval_end))
+        previous_start, previous_end = merged_raw[-1]
+        merged_raw[-1] = (previous_start, max(previous_end, interval_end))
 
-    return tuple(merged)
+    fully_covered = tuple(
+        (full_start, full_end)
+        for interval_start, interval_end in merged_raw
+        if (full_start := _ceil_minute(interval_start)) < (full_end := _floor_minute(interval_end))
+    )
+    merged_minutes: list[tuple[datetime, datetime]] = []
+
+    for interval_start, interval_end in fully_covered:
+        if not merged_minutes or interval_start > merged_minutes[-1][1]:
+            merged_minutes.append((interval_start, interval_end))
+            continue
+
+        previous_start, previous_end = merged_minutes[-1]
+        merged_minutes[-1] = (previous_start, max(previous_end, interval_end))
+
+    return tuple(merged_minutes)
 
 
 def _ceil_minute(value: datetime) -> datetime:
