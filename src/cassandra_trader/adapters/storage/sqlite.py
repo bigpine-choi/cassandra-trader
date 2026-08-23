@@ -11,8 +11,9 @@ from enum import StrEnum
 from pathlib import Path
 
 from cassandra_trader.domain.candle import MinuteCandle
+from cassandra_trader.domain.market import TradingPair, normalize_quote_currency
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SCHEMA_V1_SQL = """
 CREATE TABLE raw_ingestion_batches (
     batch_id TEXT PRIMARY KEY,
@@ -149,9 +150,137 @@ BEGIN
 END;
 """
 
+_SCHEMA_V3_SQL = """
+CREATE TABLE market_catalog_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    request_parameters_json TEXT NOT NULL,
+    quote_currency TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('SUCCEEDED', 'FAILED')),
+    market_count INTEGER NOT NULL CHECK (market_count >= 0),
+    content_hash TEXT,
+    error_type TEXT,
+    error_message TEXT,
+    CHECK (length(trim(snapshot_id)) > 0),
+    CHECK (length(trim(source)) > 0),
+    CHECK (length(trim(endpoint)) > 0),
+    CHECK (
+        length(observed_at) = 27
+        AND substr(observed_at, 20, 1) = '.'
+        AND substr(observed_at, 27, 1) = 'Z'
+    ),
+    CHECK (
+        length(available_at) = 27
+        AND substr(available_at, 20, 1) = '.'
+        AND substr(available_at, 27, 1) = 'Z'
+    ),
+    CHECK (observed_at <= available_at),
+    CHECK (
+        (
+            status = 'SUCCEEDED'
+            AND market_count > 0
+            AND content_hash IS NOT NULL
+            AND length(content_hash) = 64
+            AND content_hash NOT GLOB '*[^0-9a-f]*'
+            AND error_type IS NULL
+            AND error_message IS NULL
+        )
+        OR
+        (
+            status = 'FAILED'
+            AND market_count = 0
+            AND content_hash IS NULL
+            AND error_type IS NOT NULL
+            AND length(trim(error_type)) > 0
+        )
+    )
+);
+
+CREATE TABLE market_catalog_snapshot_members (
+    snapshot_id TEXT NOT NULL,
+    response_order INTEGER NOT NULL CHECK (response_order >= 0),
+    market TEXT NOT NULL,
+    korean_name TEXT NOT NULL,
+    english_name TEXT NOT NULL,
+    is_warning INTEGER NOT NULL CHECK (is_warning IN (0, 1)),
+    raw_payload_json TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, response_order),
+    UNIQUE (snapshot_id, market),
+    FOREIGN KEY (snapshot_id) REFERENCES market_catalog_snapshots(snapshot_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE INDEX market_catalog_snapshots_as_of
+ON market_catalog_snapshots (
+    quote_currency,
+    status,
+    available_at,
+    observed_at DESC,
+    snapshot_id DESC
+);
+
+CREATE INDEX market_catalog_snapshot_members_market
+ON market_catalog_snapshot_members (snapshot_id, market);
+
+CREATE TRIGGER market_catalog_snapshots_validate_members
+BEFORE INSERT ON market_catalog_snapshots
+WHEN (
+    (NEW.status = 'SUCCEEDED' AND (
+        SELECT COUNT(*) FROM market_catalog_snapshot_members
+        WHERE snapshot_id = NEW.snapshot_id
+    ) != NEW.market_count)
+    OR
+    (NEW.status = 'FAILED' AND EXISTS (
+        SELECT 1 FROM market_catalog_snapshot_members
+        WHERE snapshot_id = NEW.snapshot_id
+    ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshot member contract violated');
+END;
+
+CREATE TRIGGER market_catalog_snapshot_members_no_insert_after_header
+BEFORE INSERT ON market_catalog_snapshot_members
+WHEN EXISTS (
+    SELECT 1 FROM market_catalog_snapshots
+    WHERE snapshot_id = NEW.snapshot_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshot is sealed');
+END;
+
+CREATE TRIGGER market_catalog_snapshots_no_update
+BEFORE UPDATE ON market_catalog_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshots are append-only');
+END;
+
+CREATE TRIGGER market_catalog_snapshots_no_delete
+BEFORE DELETE ON market_catalog_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshots are append-only');
+END;
+
+CREATE TRIGGER market_catalog_snapshot_members_no_update
+BEFORE UPDATE ON market_catalog_snapshot_members
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshot members are append-only');
+END;
+
+CREATE TRIGGER market_catalog_snapshot_members_no_delete
+BEFORE DELETE ON market_catalog_snapshot_members
+BEGIN
+    SELECT RAISE(ABORT, 'market catalog snapshot members are append-only');
+END;
+"""
+
 _MIGRATIONS = (
     (1, _SCHEMA_V1_SQL),
     (2, _SCHEMA_V2_SQL),
+    (3, _SCHEMA_V3_SQL),
 )
 
 
@@ -223,6 +352,56 @@ class StoredMinuteCandleBackfillRun:
     status: MinuteCandleBackfillRunStatus
     error_type: str | None
     error_message: str | None
+
+
+class MarketCatalogSnapshotStatus(StrEnum):
+    """Terminal outcome of one current-market catalog request."""
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketCatalogSnapshotMemberInput:
+    """One raw market response item and its normalized trading pair."""
+
+    response_order: int
+    pair: TradingPair
+    raw_payload: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMarketCatalogSnapshotMember:
+    """One immutable member loaded from a market catalog snapshot."""
+
+    response_order: int
+    pair: TradingPair
+    raw_payload: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMarketCatalogSnapshot:
+    """One append-only market catalog snapshot and its members."""
+
+    snapshot_id: str
+    source: str
+    endpoint: str
+    request_parameters: dict[str, object]
+    quote_currency: str
+    observed_at: datetime
+    available_at: datetime
+    status: MarketCatalogSnapshotStatus
+    market_count: int
+    content_hash: str | None
+    error_type: str | None
+    error_message: str | None
+    members: tuple[StoredMarketCatalogSnapshotMember, ...]
+
+    @property
+    def pairs(self) -> tuple[TradingPair, ...]:
+        """Return snapshot pairs in deterministic market-code order."""
+
+        return tuple(member.pair for member in self.members)
 
 
 class SqliteMinuteCandleRepository:
@@ -636,6 +815,225 @@ class SqliteMinuteCandleRepository:
 
         return tuple(_stored_backfill_run(row) for row in rows)
 
+    def record_market_catalog_snapshot(
+        self,
+        *,
+        snapshot_id: str,
+        source: str,
+        endpoint: str,
+        request_parameters: Mapping[str, object],
+        quote_currency: str,
+        observed_at: datetime,
+        available_at: datetime,
+        status: MarketCatalogSnapshotStatus,
+        members: Sequence[MarketCatalogSnapshotMemberInput],
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> StoredMarketCatalogSnapshot:
+        """Atomically append one complete catalog snapshot or failed request evidence."""
+
+        if not snapshot_id.strip():
+            raise ValueError("snapshot_id must not be empty")
+
+        if not source.strip():
+            raise ValueError("source must not be empty")
+
+        if not endpoint.strip():
+            raise ValueError("endpoint must not be empty")
+
+        normalized_quote = normalize_quote_currency(quote_currency)
+        normalized_status = MarketCatalogSnapshotStatus(status)
+        observed_text = _utc_availability_text(observed_at)
+        available_text = _utc_availability_text(available_at)
+        member_items = tuple(members)
+
+        if observed_text > available_text:
+            raise ValueError("observed_at must not be after available_at")
+
+        if normalized_status is MarketCatalogSnapshotStatus.SUCCEEDED:
+            if not member_items:
+                raise ValueError(
+                    "SUCCEEDED market catalog snapshot requires a non-empty member set"
+                )
+
+            if error_type is not None or error_message is not None:
+                raise ValueError(
+                    "SUCCEEDED market catalog snapshot must not include error information"
+                )
+        else:
+            if member_items:
+                raise ValueError("FAILED market catalog snapshot must not include members")
+
+            if error_type is None or not error_type.strip():
+                raise ValueError("FAILED market catalog snapshot must include an error type")
+
+        response_orders: set[int] = set()
+        markets: set[str] = set()
+        serialized_members: list[tuple[MarketCatalogSnapshotMemberInput, str]] = []
+
+        for member in member_items:
+            if (
+                not isinstance(member.response_order, int)
+                or isinstance(member.response_order, bool)
+                or member.response_order < 0
+            ):
+                raise ValueError("response_order must be a non-negative integer")
+
+            if member.response_order in response_orders:
+                raise ValueError("duplicate response_order in market catalog snapshot")
+
+            if member.pair.code in markets:
+                raise ValueError("duplicate market in market catalog snapshot")
+
+            if member.pair.quote_currency != normalized_quote:
+                raise ValueError("snapshot member quote currency must match quote_currency")
+
+            response_orders.add(member.response_order)
+            markets.add(member.pair.code)
+            serialized_members.append((member, _json_text(member.raw_payload)))
+
+        content_hash = (
+            market_catalog_content_hash(
+                source=source,
+                quote_currency=normalized_quote,
+                members=member_items,
+            )
+            if normalized_status is MarketCatalogSnapshotStatus.SUCCEEDED
+            else None
+        )
+        request_json = _json_text(request_parameters)
+
+        with self._connection:
+            for member, raw_json in serialized_members:
+                self._connection.execute(
+                    """
+                    INSERT INTO market_catalog_snapshot_members (
+                        snapshot_id, response_order, market, korean_name,
+                        english_name, is_warning, raw_payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        member.response_order,
+                        member.pair.code,
+                        member.pair.korean_name,
+                        member.pair.english_name,
+                        int(member.pair.is_warning),
+                        raw_json,
+                    ),
+                )
+
+            self._connection.execute(
+                """
+                INSERT INTO market_catalog_snapshots (
+                    snapshot_id, source, endpoint, request_parameters_json,
+                    quote_currency, observed_at, available_at, status,
+                    market_count, content_hash, error_type, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    source,
+                    endpoint,
+                    request_json,
+                    normalized_quote,
+                    observed_text,
+                    available_text,
+                    normalized_status.value,
+                    len(member_items),
+                    content_hash,
+                    error_type,
+                    error_message,
+                ),
+            )
+
+        stored = self.get_market_catalog_snapshot(snapshot_id)
+
+        if stored is None:
+            raise RuntimeError("stored market catalog snapshot could not be reloaded")
+
+        return stored
+
+    def get_market_catalog_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> StoredMarketCatalogSnapshot | None:
+        """Return one immutable catalog snapshot by identifier."""
+
+        row = self._connection.execute(
+            "SELECT * FROM market_catalog_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+
+        return None if row is None else self._load_market_catalog_snapshot(row)
+
+    def get_market_catalog_snapshot_as_of(
+        self,
+        quote_currency: str,
+        as_of: datetime,
+    ) -> StoredMarketCatalogSnapshot | None:
+        """Return the deterministically latest successful snapshot available by a cutoff."""
+
+        normalized_quote = normalize_quote_currency(quote_currency)
+        as_of_text = _utc_availability_text(as_of)
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM market_catalog_snapshots
+            WHERE quote_currency = ?
+              AND status = 'SUCCEEDED'
+              AND available_at <= ?
+            ORDER BY observed_at DESC, available_at DESC, snapshot_id DESC
+            LIMIT 1
+            """,
+            (normalized_quote, as_of_text),
+        ).fetchone()
+
+        return None if row is None else self._load_market_catalog_snapshot(row)
+
+    def _load_market_catalog_snapshot(
+        self,
+        row: sqlite3.Row,
+    ) -> StoredMarketCatalogSnapshot:
+        member_rows = self._connection.execute(
+            """
+            SELECT *
+            FROM market_catalog_snapshot_members
+            WHERE snapshot_id = ?
+            ORDER BY market
+            """,
+            (row["snapshot_id"],),
+        ).fetchall()
+        members = tuple(
+            StoredMarketCatalogSnapshotMember(
+                response_order=member["response_order"],
+                pair=TradingPair(
+                    code=member["market"],
+                    korean_name=member["korean_name"],
+                    english_name=member["english_name"],
+                    is_warning=bool(member["is_warning"]),
+                ),
+                raw_payload=dict(json.loads(member["raw_payload_json"])),
+            )
+            for member in member_rows
+        )
+
+        return StoredMarketCatalogSnapshot(
+            snapshot_id=row["snapshot_id"],
+            source=row["source"],
+            endpoint=row["endpoint"],
+            request_parameters=dict(json.loads(row["request_parameters_json"])),
+            quote_currency=row["quote_currency"],
+            observed_at=_parse_utc(row["observed_at"]),
+            available_at=_parse_utc(row["available_at"]),
+            status=MarketCatalogSnapshotStatus(row["status"]),
+            market_count=row["market_count"],
+            content_hash=row["content_hash"],
+            error_type=row["error_type"],
+            error_message=row["error_message"],
+            members=members,
+        )
+
     def _migrate(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
 
@@ -731,6 +1129,38 @@ def _canonical_content(candle: MinuteCandle) -> dict[str, str]:
         "base_volume": _decimal_text(candle.base_volume),
         "quote_volume": _decimal_text(candle.quote_volume),
     }
+
+
+def market_catalog_content_hash(
+    *,
+    source: str,
+    quote_currency: str,
+    members: Sequence[MarketCatalogSnapshotMemberInput],
+) -> str:
+    """Hash canonical snapshot contents independent of run metadata and response order."""
+
+    if not source.strip():
+        raise ValueError("source must not be empty")
+
+    canonical_members = sorted(
+        (
+            {
+                "market": member.pair.code,
+                "korean_name": member.pair.korean_name,
+                "english_name": member.pair.english_name,
+                "is_warning": member.pair.is_warning,
+                "raw_payload": member.raw_payload,
+            }
+            for member in members
+        ),
+        key=lambda member: member["market"],
+    )
+    canonical_snapshot = {
+        "source": source,
+        "quote_currency": normalize_quote_currency(quote_currency),
+        "members": canonical_members,
+    }
+    return _sha256(_json_text(canonical_snapshot))
 
 
 def _stored_candle(row: sqlite3.Row) -> StoredMinuteCandle:

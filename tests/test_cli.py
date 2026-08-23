@@ -14,6 +14,7 @@ from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
     RuntimeRecoveryKind,
 )
+from cassandra_trader.apps.market_universe import MarketCatalogCaptureResult
 from cassandra_trader.apps.minute_candle_backfill import MinuteCandleBackfillResult
 from cassandra_trader.apps.minute_reconciliation import (
     MinuteReconciliationResult,
@@ -33,7 +34,11 @@ from cassandra_trader.domain.four_hour_bar import (
     FourHourBarStatus,
     FourHourCandle,
 )
-from cassandra_trader.domain.market import TradingPair
+from cassandra_trader.domain.market import (
+    MarketUniverseResult,
+    MarketUniverseStatus,
+    TradingPair,
+)
 from cassandra_trader.domain.public_stream import StreamType, TickerEvent
 
 
@@ -75,6 +80,235 @@ def test_markets_command(
     captured = capsys.readouterr()
 
     assert captured.out == "KRW trading pairs: 2\nKRW-BTC      비트코인\n"
+
+
+def test_capture_universe_outputs_deterministic_snapshot_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    observed_at = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    available_at = observed_at + timedelta(microseconds=500_000)
+    database = tmp_path / "catalog.db"
+
+    async def fake_capture(database_path: str | Path) -> MarketCatalogCaptureResult:
+        assert database_path == database
+        return MarketCatalogCaptureResult(
+            snapshot_id="snapshot-1",
+            quote_currency="KRW",
+            observed_at=observed_at,
+            available_at=available_at,
+            market_count=2,
+            content_hash="a" * 64,
+            pairs=(
+                TradingPair("KRW-ADA", "에이다", "Cardano", True),
+                TradingPair("KRW-BTC", "비트코인", "Bitcoin", False),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.capture_krw_market_catalog",
+        fake_capture,
+    )
+
+    exit_code = main(["capture-universe", "--database", str(database)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        '{"type":"snapshot","status":"SUCCEEDED","snapshot_id":"snapshot-1",'
+        '"quote_currency":"KRW","observed_at":"2026-08-23T12:00:00Z",'
+        '"available_at":"2026-08-23T12:00:00.500000Z","market_count":2,'
+        '"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n'
+    )
+
+
+def test_capture_universe_failure_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    async def fake_capture(database_path: str | Path) -> MarketCatalogCaptureResult:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.capture_krw_market_catalog",
+        fake_capture,
+    )
+
+    exit_code = main(["capture-universe", "--database", str(tmp_path / "catalog.db")])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "type": "snapshot",
+        "status": "FAILED",
+        "error": {"type": "TimeoutError", "message": "timed out"},
+    }
+
+
+def test_universe_as_of_outputs_sorted_json_lines_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    as_of = datetime(2026, 8, 23, 13, 0, tzinfo=UTC)
+    observed_at = as_of - timedelta(hours=1)
+    available_at = observed_at + timedelta(seconds=1)
+    database = tmp_path / "catalog.db"
+
+    def fake_resolve(
+        quote_currency: str,
+        cutoff: datetime,
+        database_path: str | Path,
+    ) -> MarketUniverseResult:
+        assert quote_currency == "KRW"
+        assert cutoff == as_of
+        assert database_path == database
+        return MarketUniverseResult(
+            status=MarketUniverseStatus.AVAILABLE,
+            quote_currency="KRW",
+            as_of=as_of,
+            snapshot_id="snapshot-1",
+            observed_at=observed_at,
+            available_at=available_at,
+            content_hash="b" * 64,
+            pairs=(
+                TradingPair("KRW-ADA", "에이다", "Cardano", True),
+                TradingPair("KRW-BTC", "비트코인", "Bitcoin", False),
+            ),
+        )
+
+    def unexpected_network(*args, **kwargs):
+        raise AssertionError("universe-as-of must not call the network")
+
+    monkeypatch.setattr("cassandra_trader.cli.resolve_market_universe_as_of", fake_resolve)
+    monkeypatch.setattr("cassandra_trader.cli.fetch_krw_trading_pairs", unexpected_network)
+    monkeypatch.setattr("cassandra_trader.cli.capture_krw_market_catalog", unexpected_network)
+
+    exit_code = main(
+        [
+            "universe-as-of",
+            "--as-of",
+            "2026-08-23T13:00:00Z",
+            "--database",
+            str(database),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 0
+    assert lines[:2] == [
+        {
+            "type": "market",
+            "market": "KRW-ADA",
+            "korean_name": "에이다",
+            "english_name": "Cardano",
+            "is_warning": True,
+        },
+        {
+            "type": "market",
+            "market": "KRW-BTC",
+            "korean_name": "비트코인",
+            "english_name": "Bitcoin",
+            "is_warning": False,
+        },
+    ]
+    assert lines[2] == {
+        "type": "summary",
+        "status": "AVAILABLE",
+        "quote_currency": "KRW",
+        "as_of": "2026-08-23T13:00:00Z",
+        "snapshot_id": "snapshot-1",
+        "observed_at": "2026-08-23T12:00:00Z",
+        "available_at": "2026-08-23T12:00:01Z",
+        "content_hash": "b" * 64,
+        "market_count": 2,
+    }
+
+
+def test_universe_as_of_unresolved_outputs_summary_only_and_exit_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    as_of = datetime(2026, 8, 23, 11, 59, 59, tzinfo=UTC)
+
+    def fake_resolve(*args, **kwargs) -> MarketUniverseResult:
+        return MarketUniverseResult(
+            status=MarketUniverseStatus.UNRESOLVED,
+            quote_currency="KRW",
+            as_of=as_of,
+            snapshot_id=None,
+            observed_at=None,
+            available_at=None,
+            content_hash=None,
+            pairs=(),
+        )
+
+    monkeypatch.setattr("cassandra_trader.cli.resolve_market_universe_as_of", fake_resolve)
+
+    exit_code = main(
+        [
+            "universe-as-of",
+            "--as-of",
+            "2026-08-23T11:59:59Z",
+            "--database",
+            str(tmp_path / "catalog.db"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {
+            "type": "summary",
+            "status": "UNRESOLVED",
+            "quote_currency": "KRW",
+            "as_of": "2026-08-23T11:59:59Z",
+            "snapshot_id": None,
+            "observed_at": None,
+            "available_at": None,
+            "content_hash": None,
+            "market_count": 0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--as-of", "2026-08-23T12:00:00"],
+        ["--as-of", "2026-08-23T21:00:00+09:00"],
+        ["--quote-currency", "ＫＲＷ", "--as-of", "2026-08-23T12:00:00Z"],
+    ],
+)
+def test_universe_as_of_rejects_invalid_arguments_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    def unexpected_query(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.resolve_market_universe_as_of",
+        unexpected_query,
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "universe-as-of",
+                *arguments,
+                "--database",
+                str(tmp_path / "catalog.db"),
+            ]
+        )
+
+    assert called is False
 
 
 def test_candles_command(

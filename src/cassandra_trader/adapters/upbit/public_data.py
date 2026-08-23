@@ -9,7 +9,7 @@ from typing import Any
 from upbit.types import CandleListMinutesResponse, TradingPairListResponse
 
 from cassandra_trader.domain.candle import MinuteCandle
-from cassandra_trader.domain.market import TradingPair
+from cassandra_trader.domain.market import TradingPair, normalize_quote_currency
 
 type ListTradingPairs = Callable[..., Awaitable[TradingPairListResponse]]
 type ListMinuteCandles = Callable[..., Awaitable[CandleListMinutesResponse]]
@@ -36,6 +36,26 @@ class MinuteCandleResponseBatch:
     observations: tuple[MinuteCandleObservation, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class TradingPairObservation:
+    """One raw Upbit market response item and its normalized trading pair."""
+
+    response_order: int
+    market: str
+    raw_payload: dict[str, object]
+    pair: TradingPair
+
+
+@dataclass(frozen=True, slots=True)
+class TradingPairResponseBatch:
+    """One recorded Upbit trading-pair REST response for a quote currency."""
+
+    endpoint: str
+    request_parameters: dict[str, bool]
+    received_at: datetime
+    observations: tuple[TradingPairObservation, ...]
+
+
 class UpbitPublicDataAdapter:
     """Translate Upbit SDK responses into Cassandra domain objects."""
 
@@ -43,9 +63,12 @@ class UpbitPublicDataAdapter:
         self,
         list_trading_pairs: ListTradingPairs | None = None,
         list_minute_candles: ListMinuteCandles | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._list_trading_pairs = list_trading_pairs
         self._list_minute_candles = list_minute_candles
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def list_trading_pairs(
         self,
@@ -53,19 +76,35 @@ class UpbitPublicDataAdapter:
     ) -> tuple[TradingPair, ...]:
         """Return sorted trading pairs for the requested quote currency."""
 
-        normalized_quote = quote_currency.strip().upper()
+        batch = await self.fetch_trading_pair_batch(quote_currency)
+        pairs: dict[str, TradingPair] = {}
 
-        if not normalized_quote:
-            raise ValueError("quote_currency must not be empty")
+        for observation in batch.observations:
+            if observation.market in pairs:
+                raise ValueError(f"duplicate market in trading-pair response: {observation.market}")
+
+            pairs[observation.market] = observation.pair
+
+        return tuple(pairs[market] for market in sorted(pairs))
+
+    async def fetch_trading_pair_batch(
+        self,
+        quote_currency: str = "KRW",
+    ) -> TradingPairResponseBatch:
+        """Fetch raw market details alongside normalized pairs for one quote."""
+
+        normalized_quote = normalize_quote_currency(quote_currency)
 
         if self._list_trading_pairs is None:
             raise RuntimeError("trading-pair API is not configured")
 
-        raw_pairs = await self._list_trading_pairs(is_details=True)
-        prefix = f"{normalized_quote}-"
+        request_parameters = {"is_details": True}
+        raw_pairs = await self._list_trading_pairs(**request_parameters)
+        received_at = _as_utc(self._clock(), "clock")
+        observations: list[TradingPairObservation] = []
 
-        pairs = [
-            TradingPair(
+        for response_order, raw in enumerate(raw_pairs):
+            pair = TradingPair(
                 code=raw.market,
                 korean_name=raw.korean_name,
                 english_name=raw.english_name,
@@ -74,11 +113,25 @@ class UpbitPublicDataAdapter:
                     or raw.market_warning == "CAUTION"
                 ),
             )
-            for raw in raw_pairs
-            if raw.market.startswith(prefix)
-        ]
 
-        return tuple(sorted(pairs, key=lambda pair: pair.code))
+            if pair.quote_currency != normalized_quote:
+                continue
+
+            observations.append(
+                TradingPairObservation(
+                    response_order=response_order,
+                    market=pair.code,
+                    raw_payload=_sdk_model_payload(raw),
+                    pair=pair,
+                )
+            )
+
+        return TradingPairResponseBatch(
+            endpoint="/v1/market/all",
+            request_parameters=request_parameters,
+            received_at=received_at,
+            observations=tuple(sorted(observations, key=lambda item: item.market)),
+        )
 
     async def list_minute_candles(
         self,
@@ -146,7 +199,7 @@ class UpbitPublicDataAdapter:
             1,
             **request_parameters,
         )
-        received_at = datetime.now(UTC)
+        received_at = _as_utc(self._clock(), "clock")
         observations: list[MinuteCandleObservation] = []
 
         for response_order, raw in enumerate(raw_candles):
@@ -185,7 +238,13 @@ def _normalize_market(market: str) -> str:
     normalized_market = market.strip().upper()
     quote, separator, base = normalized_market.partition("-")
 
-    if not separator or not quote.isalnum() or not base.isalnum():
+    if (
+        not separator
+        or not quote.isascii()
+        or not quote.isalnum()
+        or not base.isascii()
+        or not base.isalnum()
+    ):
         raise ValueError(f"Invalid market code: {market}")
 
     return normalized_market
@@ -206,4 +265,24 @@ def _sdk_model_payload(model: Any) -> dict[str, object]:
     if callable(model_dump):
         return dict(model_dump(mode="json"))
 
-    return dict(vars(model))
+    return {key: _json_compatible(value) for key, value in vars(model).items()}
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+
+    if hasattr(value, "__dict__"):
+        return {key: _json_compatible(item) for key, item in vars(value).items()}
+
+    return value
+
+
+def _as_utc(value: datetime, name: str) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware")
+
+    return value.astimezone(UTC)

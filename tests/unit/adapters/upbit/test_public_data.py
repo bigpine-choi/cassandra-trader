@@ -85,14 +85,71 @@ def test_list_trading_pairs_filters_normalizes_and_sorts() -> None:
     assert pairs[1].base_currency == "BTC"
 
 
-def test_list_trading_pairs_rejects_empty_quote_currency() -> None:
+def test_fetch_trading_pair_batch_preserves_raw_details_and_response_order() -> None:
+    async def fake_list(*, is_details: bool) -> TradingPairListResponse:
+        return cast(
+            TradingPairListResponse,
+            [
+                _raw_pair("BTC-ETH", "이더리움", "Ethereum"),
+                _raw_pair("KRW-BTC", "비트코인", "Bitcoin", event_warning=True),
+                _raw_pair("KRW-ADA", "에이다", "Cardano", legacy_warning="CAUTION"),
+            ],
+        )
+
+    adapter = UpbitPublicDataAdapter(fake_list)
+
+    batch = asyncio.run(adapter.fetch_trading_pair_batch(" krw "))
+
+    assert batch.endpoint == "/v1/market/all"
+    assert batch.request_parameters == {"is_details": True}
+    assert batch.received_at.tzinfo is UTC
+    assert [item.response_order for item in batch.observations] == [2, 1]
+    assert [item.market for item in batch.observations] == ["KRW-ADA", "KRW-BTC"]
+    assert batch.observations[1].pair.is_warning is True
+    assert batch.observations[1].raw_payload["market_event"] == {"warning": True}
+    assert batch.observations[0].raw_payload["market_warning"] == "CAUTION"
+
+
+def test_list_trading_pairs_rejects_duplicate_market_response() -> None:
+    async def fake_list(*, is_details: bool) -> TradingPairListResponse:
+        return cast(
+            TradingPairListResponse,
+            [
+                _raw_pair("KRW-BTC", "비트코인", "Bitcoin"),
+                _raw_pair("KRW-BTC", "비트코인", "Bitcoin"),
+            ],
+        )
+
+    adapter = UpbitPublicDataAdapter(fake_list)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        asyncio.run(adapter.list_trading_pairs("KRW"))
+
+
+@pytest.mark.parametrize("quote_currency", ["   ", "ＫＲＷ", "KR원", "KRW-"])
+def test_list_trading_pairs_rejects_invalid_quote_currency_before_request(
+    quote_currency: str,
+) -> None:
     async def fake_list(*, is_details: bool) -> TradingPairListResponse:
         raise AssertionError("API must not be called")
 
     adapter = UpbitPublicDataAdapter(fake_list)
 
     with pytest.raises(ValueError, match="quote_currency"):
-        asyncio.run(adapter.list_trading_pairs("   "))
+        asyncio.run(adapter.list_trading_pairs(quote_currency))
+
+
+def test_list_trading_pairs_rejects_non_ascii_response_market() -> None:
+    async def fake_list(*, is_details: bool) -> TradingPairListResponse:
+        return cast(
+            TradingPairListResponse,
+            [_raw_pair("KRW-비트", "비트", "Bitcoin")],
+        )
+
+    adapter = UpbitPublicDataAdapter(fake_list)
+
+    with pytest.raises(ValueError, match="trading-pair code"):
+        asyncio.run(adapter.list_trading_pairs("KRW"))
 
 
 def test_list_minute_candles_maps_sdk_response() -> None:
