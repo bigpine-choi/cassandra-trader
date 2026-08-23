@@ -28,6 +28,16 @@ class ResolvedMinuteSlot:
     canonical_available_at: datetime | None
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("start_time_utc", self.start_time_utc),
+            ("end_time_utc", self.end_time_utc),
+        ):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError(f"{name} must be timezone-aware UTC")
+
+        if self.start_time_utc.second != 0 or self.start_time_utc.microsecond != 0:
+            raise ValueError("start_time_utc must align to a one-minute UTC boundary")
+
         if self.end_time_utc != self.start_time_utc + timedelta(minutes=1):
             raise ValueError("minute slot must span exactly one minute")
 
@@ -38,6 +48,15 @@ class ResolvedMinuteSlot:
                 or self.canonical_available_at is None
             ):
                 raise ValueError("TRADED slot requires canonical candle revision information")
+
+            if self.canonical_revision < 1:
+                raise ValueError("TRADED canonical_revision must be at least 1")
+
+            if (
+                self.canonical_available_at.tzinfo is None
+                or self.canonical_available_at.utcoffset() != timedelta(0)
+            ):
+                raise ValueError("canonical_available_at must be timezone-aware UTC")
 
             if (
                 self.candle.market != self.market

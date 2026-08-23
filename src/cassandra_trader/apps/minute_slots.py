@@ -6,6 +6,7 @@ from pathlib import Path
 from cassandra_trader.adapters.storage.sqlite import (
     MinuteCandleBackfillRunStatus,
     SqliteMinuteCandleRepository,
+    StoredMinuteCandleBackfillRun,
 )
 from cassandra_trader.domain.minute_slot import MinuteSlotStatus, ResolvedMinuteSlot
 
@@ -56,12 +57,30 @@ def resolve_minute_slots_from_repository(
         as_of,
         status=MinuteCandleBackfillRunStatus.SUCCEEDED,
     )
+    successful_intervals = _merge_successful_intervals(
+        successful_runs,
+        start_time_utc,
+        end_time_utc,
+    )
     slots: list[ResolvedMinuteSlot] = []
     slot_start = start_time_utc
+    interval_index = 0
 
     while slot_start < end_time_utc:
         slot_end = slot_start + timedelta(minutes=1)
         stored = canonical.get(slot_start)
+
+        while (
+            interval_index < len(successful_intervals)
+            and successful_intervals[interval_index][1] <= slot_start
+        ):
+            interval_index += 1
+
+        covered_by_success = (
+            interval_index < len(successful_intervals)
+            and successful_intervals[interval_index][0] <= slot_start
+            and successful_intervals[interval_index][1] >= slot_end
+        )
 
         if stored is not None:
             slots.append(
@@ -75,12 +94,7 @@ def resolve_minute_slots_from_repository(
                     canonical_available_at=stored.available_at,
                 )
             )
-        elif any(
-            run.requested_start <= slot_start
-            and run.requested_end >= slot_end
-            and run.observed_at >= slot_end
-            for run in successful_runs
-        ):
+        elif covered_by_success:
             slots.append(
                 ResolvedMinuteSlot(
                     market=market,
@@ -108,6 +122,33 @@ def resolve_minute_slots_from_repository(
         slot_start = slot_end
 
     return tuple(slots)
+
+
+def _merge_successful_intervals(
+    runs: tuple[StoredMinuteCandleBackfillRun, ...],
+    requested_start: datetime,
+    requested_end: datetime,
+) -> tuple[tuple[datetime, datetime], ...]:
+    clipped = sorted(
+        (
+            max(run.requested_start, requested_start),
+            min(run.requested_end, run.observed_at, requested_end),
+        )
+        for run in runs
+        if max(run.requested_start, requested_start)
+        < min(run.requested_end, run.observed_at, requested_end)
+    )
+    merged: list[tuple[datetime, datetime]] = []
+
+    for interval_start, interval_end in clipped:
+        if not merged or interval_start > merged[-1][1]:
+            merged.append((interval_start, interval_end))
+            continue
+
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, interval_end))
+
+    return tuple(merged)
 
 
 def _validate_range(start: datetime, end: datetime) -> None:

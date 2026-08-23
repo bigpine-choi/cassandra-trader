@@ -218,6 +218,11 @@ def test_available_at_uses_ingested_at_after_validation(tmp_path: Path) -> None:
 
     assert stored is not None
     assert stored.available_at == ingested_at
+    with sqlite3.connect(database) as connection:
+        stored_text = connection.execute(
+            "SELECT available_at FROM canonical_minute_candles"
+        ).fetchone()[0]
+    assert stored_text == "2025-01-01T12:02:30.000000Z"
 
 
 def test_rejects_received_at_after_ingested_at(tmp_path: Path) -> None:
@@ -318,6 +323,17 @@ def test_backfill_run_evidence_enforces_status_contract_and_is_append_only(
                 status=MinuteCandleBackfillRunStatus.FAILED,
             )
 
+        with pytest.raises(ValueError, match="observed_at"):
+            repository.record_minute_candle_backfill_run(
+                run_id="time-travel",
+                market="KRW-BTC",
+                requested_start=_START,
+                requested_end=end,
+                observed_at=_RECEIVED + timedelta(seconds=1),
+                available_at=_RECEIVED,
+                status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+            )
+
     assert len(runs) == 1
     assert runs[0].run_id == "run-success"
     assert runs[0].status is MinuteCandleBackfillRunStatus.SUCCEEDED
@@ -325,6 +341,26 @@ def test_backfill_run_evidence_enforces_status_contract_and_is_append_only(
     assert runs[0].error_message is None
 
     with sqlite3.connect(database) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint"):
+            connection.execute(
+                """
+                INSERT INTO minute_candle_backfill_runs (
+                    run_id, market, requested_start, requested_end,
+                    observed_at, available_at, status, error_type, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "invalid-db-time",
+                    "KRW-BTC",
+                    "2025-01-01T12:00:00Z",
+                    "2025-01-01T12:03:00Z",
+                    "2025-01-01T12:02:01.000000Z",
+                    "2025-01-01T12:02:00.000000Z",
+                    "SUCCEEDED",
+                    None,
+                    None,
+                ),
+            )
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute(
                 "UPDATE minute_candle_backfill_runs SET market = ? WHERE run_id = ?",
@@ -629,3 +665,114 @@ def test_canonical_coverage_uses_exact_half_open_range_without_synthesizing(
     assert coverage.observed_slots == 1
     assert coverage.absent_slots == 2
     assert len(stored) == 1
+
+
+def test_canonical_availability_compares_mixed_utc_precision_exactly(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    half_second = _RECEIVED + timedelta(microseconds=500_000)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest(
+            repository,
+            batch_id="half-second",
+            records=(_record(),),
+            received_at=_RECEIVED,
+            ingested_at=half_second,
+        )
+        before = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            _RECEIVED,
+        )
+        at_boundary = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            half_second,
+        )
+        coverage_before = repository.get_canonical_minute_candle_coverage(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            _RECEIVED,
+        )
+        coverage_at_boundary = repository.get_canonical_minute_candle_coverage(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            half_second,
+        )
+
+    assert before == ()
+    assert len(at_boundary) == 1
+    assert coverage_before.observed_slots == 0
+    assert coverage_before.absent_slots == 1
+    assert coverage_at_boundary.observed_slots == 1
+    assert coverage_at_boundary.absent_slots == 0
+
+
+def test_legacy_second_precision_canonical_is_available_with_fractional_as_of(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy.db"
+    _create_v1_database(database)
+    as_of = datetime(2025, 1, 1, 12, 2, 1, 500_000, tzinfo=UTC)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        stored = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _START + timedelta(minutes=1),
+            as_of,
+        )
+
+    assert len(stored) == 1
+    assert stored[0].available_at == datetime(2025, 1, 1, 12, 2, 1, tzinfo=UTC)
+
+
+def test_backfill_evidence_availability_uses_exact_half_second_boundary(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = _START + timedelta(minutes=1)
+    half_second = _RECEIVED + timedelta(microseconds=500_000)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        repository.record_minute_candle_backfill_run(
+            run_id="half-second-evidence",
+            market="KRW-BTC",
+            requested_start=_START,
+            requested_end=end,
+            observed_at=_RECEIVED,
+            available_at=half_second,
+            status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+        )
+        before = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            end,
+            _RECEIVED,
+        )
+        at_boundary = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            end,
+            half_second,
+        )
+
+    assert before == ()
+    assert len(at_boundary) == 1
+    assert at_boundary[0].available_at == half_second
+    with sqlite3.connect(database) as connection:
+        observed_text, available_text = connection.execute(
+            """
+            SELECT observed_at, available_at
+            FROM minute_candle_backfill_runs
+            WHERE run_id = 'half-second-evidence'
+            """
+        ).fetchone()
+    assert observed_text == "2025-01-01T12:02:00.000000Z"
+    assert available_text == "2025-01-01T12:02:00.500000Z"

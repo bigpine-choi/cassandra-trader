@@ -105,6 +105,17 @@ CREATE TABLE minute_candle_backfill_runs (
     error_message TEXT,
     CHECK (requested_start < requested_end),
     CHECK (
+        length(observed_at) = 27
+        AND substr(observed_at, 20, 1) = '.'
+        AND substr(observed_at, 27, 1) = 'Z'
+    ),
+    CHECK (
+        length(available_at) = 27
+        AND substr(available_at, 20, 1) = '.'
+        AND substr(available_at, 27, 1) = 'Z'
+    ),
+    CHECK (observed_at <= available_at),
+    CHECK (
         (status = 'SUCCEEDED' AND error_type IS NULL AND error_message IS NULL)
         OR
         (status = 'FAILED' AND error_type IS NOT NULL AND length(trim(error_type)) > 0)
@@ -113,7 +124,16 @@ CREATE TABLE minute_candle_backfill_runs (
 
 CREATE INDEX minute_candle_backfill_runs_lookup
 ON minute_candle_backfill_runs (
-    market, status, available_at, requested_start, requested_end, observed_at
+    market,
+    status,
+    (CASE
+        WHEN instr(available_at, '.') = 0
+        THEN substr(available_at, 1, 19) || '.000000Z'
+        ELSE available_at
+    END),
+    requested_start,
+    requested_end,
+    observed_at
 );
 
 CREATE TRIGGER minute_candle_backfill_runs_no_update
@@ -243,7 +263,7 @@ class SqliteMinuteCandleRepository:
 
         effective_ingested_at = ingested_at or datetime.now(UTC)
         received_text = _utc_text(received_at)
-        ingested_text = _utc_text(effective_ingested_at)
+        ingested_text = _utc_availability_text(effective_ingested_at)
 
         if received_at > effective_ingested_at:
             raise ValueError("received_at must not be after ingested_at")
@@ -435,13 +455,14 @@ class SqliteMinuteCandleRepository:
 
         start_text = _utc_text(start_time_utc)
         end_text = _utc_text(end_time_utc)
-        as_of_text = _utc_text(as_of)
+        as_of_text = _utc_availability_text(as_of)
+        available_at_key = _utc_comparison_key_sql("available_at")
 
         if start_time_utc >= end_time_utc:
             raise ValueError("start_time_utc must be before end_time_utc")
 
         rows = self._connection.execute(
-            """
+            f"""
             WITH available_revisions AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -452,7 +473,7 @@ class SqliteMinuteCandleRepository:
                 WHERE market = ?
                   AND start_time_utc >= ?
                   AND start_time_utc < ?
-                  AND available_at <= ?
+                  AND {available_at_key} <= ?
             )
             SELECT *
             FROM available_revisions
@@ -476,10 +497,11 @@ class SqliteMinuteCandleRepository:
         _validate_minute_range(start_time_utc, end_time_utc)
         start_text = _utc_text(start_time_utc)
         end_text = _utc_text(end_time_utc)
-        as_of_text = _utc_text(as_of)
+        as_of_text = _utc_availability_text(as_of)
+        available_at_key = _utc_comparison_key_sql("available_at")
         expected_slots = int((end_time_utc - start_time_utc) // timedelta(minutes=1))
         row = self._connection.execute(
-            """
+            f"""
             SELECT COUNT(DISTINCT start_time_utc) AS observed_slots,
                    MIN(start_time_utc) AS earliest_candle_time,
                    MAX(start_time_utc) AS latest_candle_time
@@ -487,7 +509,7 @@ class SqliteMinuteCandleRepository:
             WHERE market = ?
               AND start_time_utc >= ?
               AND start_time_utc < ?
-              AND available_at <= ?
+              AND {available_at_key} <= ?
             """,
             (market, start_text, end_text, as_of_text),
         ).fetchone()
@@ -535,6 +557,11 @@ class SqliteMinuteCandleRepository:
         _validate_minute_range(requested_start, requested_end)
         effective_available_at = available_at or datetime.now(UTC)
         status = MinuteCandleBackfillRunStatus(status)
+        observed_text = _utc_availability_text(observed_at)
+        available_text = _utc_availability_text(effective_available_at)
+
+        if observed_text > available_text:
+            raise ValueError("observed_at must not be after available_at")
 
         if status is MinuteCandleBackfillRunStatus.SUCCEEDED and (
             error_type is not None or error_message is not None
@@ -559,8 +586,8 @@ class SqliteMinuteCandleRepository:
                     market,
                     _utc_text(requested_start),
                     _utc_text(requested_end),
-                    _utc_text(observed_at),
-                    _utc_text(effective_available_at),
+                    observed_text,
+                    available_text,
                     status.value,
                     error_type,
                     error_message,
@@ -583,7 +610,7 @@ class SqliteMinuteCandleRepository:
             market,
             _utc_text(end_time_utc),
             _utc_text(start_time_utc),
-            _utc_text(as_of),
+            _utc_availability_text(as_of),
         ]
         status_clause = ""
 
@@ -592,6 +619,7 @@ class SqliteMinuteCandleRepository:
             status_clause = "AND status = ?"
             parameters.append(normalized_status.value)
 
+        available_at_key = _utc_comparison_key_sql("available_at")
         rows = self._connection.execute(
             f"""
             SELECT *
@@ -599,9 +627,9 @@ class SqliteMinuteCandleRepository:
             WHERE market = ?
               AND requested_start < ?
               AND requested_end > ?
-              AND available_at <= ?
+              AND {available_at_key} <= ?
               {status_clause}
-            ORDER BY available_at, run_id
+            ORDER BY {available_at_key}, run_id
             """,
             parameters,
         ).fetchall()
@@ -761,6 +789,20 @@ def _utc_text(value: datetime) -> str:
         raise ValueError("timestamps must be timezone-aware UTC")
 
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _utc_availability_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("timestamps must be timezone-aware UTC")
+
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _utc_comparison_key_sql(column: str) -> str:
+    return (
+        f"CASE WHEN instr({column}, '.') = 0 "
+        f"THEN substr({column}, 1, 19) || '.000000Z' ELSE {column} END"
+    )
 
 
 def _validate_minute_range(start: datetime, end: datetime) -> None:

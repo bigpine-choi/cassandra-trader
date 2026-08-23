@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from cassandra_trader.adapters.storage.sqlite import (
     MinuteCandleBackfillRunStatus,
     RawMinuteCandleInput,
@@ -238,6 +240,70 @@ def test_overlapping_successful_ranges_combine_across_requested_range(
 
     assert len(slots) == 4
     assert all(slot.status is MinuteSlotStatus.NO_TRADE for slot in slots)
+
+
+def test_adjacent_successful_ranges_merge_but_preserve_middle_unresolved_gap(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = _START + timedelta(minutes=4)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _record_run(
+            repository,
+            run_id="first",
+            start=_START,
+            end=_START + timedelta(minutes=1),
+            observed_at=end,
+            available_at=_AVAILABLE,
+        )
+        _record_run(
+            repository,
+            run_id="adjacent",
+            start=_START + timedelta(minutes=1),
+            end=_START + timedelta(minutes=2),
+            observed_at=end,
+            available_at=_AVAILABLE,
+        )
+        _record_run(
+            repository,
+            run_id="after-gap",
+            start=_START + timedelta(minutes=3),
+            end=end,
+            observed_at=end,
+            available_at=_AVAILABLE,
+        )
+
+    slots = resolve_minute_slots("KRW-BTC", _START, end, _AVAILABLE, database)
+
+    assert [slot.status for slot in slots] == [
+        MinuteSlotStatus.NO_TRADE,
+        MinuteSlotStatus.NO_TRADE,
+        MinuteSlotStatus.UNRESOLVED,
+        MinuteSlotStatus.NO_TRADE,
+    ]
+
+
+def test_invalid_evidence_time_cannot_create_historical_no_trade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = _START + timedelta(minutes=1)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        with pytest.raises(ValueError, match="observed_at"):
+            _record_run(
+                repository,
+                run_id="invalid-time",
+                start=_START,
+                end=end,
+                observed_at=_LATE,
+                available_at=_AVAILABLE,
+            )
+
+    slots = resolve_minute_slots("KRW-BTC", _START, end, _LATE, database)
+
+    assert slots[0].status is MinuteSlotStatus.UNRESOLVED
 
 
 def test_resolver_selects_latest_canonical_revision_available_as_of(
