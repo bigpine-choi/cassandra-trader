@@ -224,8 +224,9 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
 - 실제 신호 평가와 주문 가능 후보를 위한 execution candidate universe만 point-in-time 30일
   유동성 top-N shortlist를 사용한다. 초기 운영 목표 `top_n=100`은 코드 상수가 아니라 실행
   설정과 manifest에 명시한다.
-- execution candidate 중 최대 6개 보유를 목표로 하지만 signal·portfolio·execution과 상장 후
-  90일·authoritative listing history 정책은 아직 구현되지 않았다.
+- execution candidate 중 실제 보유 종목 수는 고정하지 않고 비용 차감 엣지·불확실성·유동성·
+  포트폴리오 분산효과로 결정하지만 signal·portfolio·execution과 상장 후 90일·authoritative
+  listing history 정책은 아직 구현되지 않았다.
 - analysis universe의 30일 minute dataset은 explicit resumable bootstrap으로 구축한다. 실행
   시작의 `resume_as_of`에서 이미 43,200 slot이 resolved된 market은 네트워크 없이 건너뛰고,
   incomplete market은 동일한 전체 bounded range를 순차 재실행한다. canonical과 successful
