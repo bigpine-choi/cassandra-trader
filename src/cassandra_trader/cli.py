@@ -16,6 +16,12 @@ from cassandra_trader.apps.liquidity_dataset_bootstrap import (
     bootstrap_market_payload,
     bootstrap_summary_payload,
 )
+from cassandra_trader.apps.liquidity_dataset_refresh import (
+    LiquidityDatasetRefreshStatus,
+    refresh_liquidity_dataset,
+    refresh_market_payload,
+    refresh_summary_payload,
+)
 from cassandra_trader.apps.liquidity_top_n import evaluate_liquidity_top_n_as_of
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
 from cassandra_trader.apps.market_data_runtime import (
@@ -354,6 +360,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="positive maximum catalog snapshot age in seconds",
     )
     bootstrap_dataset.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    refresh_dataset = commands.add_parser(
+        "refresh-liquidity-dataset",
+        help="capture the KRW catalog and incrementally refresh the rolling dataset",
+    )
+    refresh_dataset.add_argument(
+        "--quote-currency",
+        type=_krw_quote_currency,
+        required=True,
+        help="quote currency (must be KRW)",
+    )
+    refresh_dataset.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    refresh_dataset.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -874,6 +903,29 @@ async def _bootstrap_liquidity_dataset(
     return 0
 
 
+async def _refresh_liquidity_dataset(
+    quote_currency: str,
+    maximum_snapshot_age_seconds: int,
+    database: Path,
+) -> int:
+    result = await refresh_liquidity_dataset(
+        quote_currency,
+        database,
+        timedelta(seconds=maximum_snapshot_age_seconds),
+    )
+    for market_result in result.markets:
+        print(json.dumps(refresh_market_payload(market_result), separators=(",", ":")))
+    print(json.dumps(refresh_summary_payload(result.summary), separators=(",", ":")))
+    if result.summary.status is LiquidityDatasetRefreshStatus.UNRESOLVED:
+        return 2
+    if result.summary.status in {
+        LiquidityDatasetRefreshStatus.PARTIAL_FAILURE,
+        LiquidityDatasetRefreshStatus.CATALOG_FAILED,
+    }:
+        return 1
+    return 0
+
+
 def _optional_utc_text(value: datetime | None) -> str:
     if value is None:
         return "None"
@@ -1145,6 +1197,15 @@ def main(argv: Sequence[str] | None = None) -> int | None:
                 arguments.quote_currency,
                 arguments.universe_as_of,
                 arguments.window_end,
+                arguments.maximum_snapshot_age_seconds,
+                arguments.database,
+            )
+        )
+
+    if arguments.command == "refresh-liquidity-dataset":
+        return asyncio.run(
+            _refresh_liquidity_dataset(
+                arguments.quote_currency,
                 arguments.maximum_snapshot_age_seconds,
                 arguments.database,
             )

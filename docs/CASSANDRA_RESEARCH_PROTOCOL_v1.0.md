@@ -48,7 +48,7 @@ LLM은 문서·코드·연구 보조에 사용할 수 있지만 주문 경로의
 현재 저장소에는 Python 3.12와 `uv` 기반 패키지, 공식 Upbit SDK의 인증 없는 공개 시장 조회,
 append-only raw/canonical 1분봉과 bounded backfill evidence, point-in-time minute slot·4시간봉,
 catalog snapshot·eligibility, 30일 liquidity·top-N 평가와 fresh non-warning analysis universe
-전체의 resumable dataset bootstrap, Ruff·Pytest·GitHub Actions 품질 검사가 구현되어 있다. 특징,
+전체의 resumable bootstrap·incremental run-once refresh, Ruff·Pytest·GitHub Actions 품질 검사가 구현되어 있다. 특징,
 모델, 백테스트, 계좌·원장, 주문, paper/shadow/live는 아직 구현되지 않았다. 따라서 이후
 장들의 연구·운영 구성요소는 현재 기능 설명이 아니라 구현 후 충족해야 할 계약이다.
 클라우드/VPS의 24시간 이벤트 기반 실행도 현재 기능이 아니라 검증·승격을 거쳐야 할 목표
@@ -222,8 +222,11 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
   시작의 `resume_as_of`에서 이미 43,200 slot이 resolved된 market은 네트워크 없이 건너뛰고,
   incomplete market은 동일한 전체 bounded range를 순차 재실행한다. canonical과 successful
   evidence만 checkpoint로 사용하며 top-N으로 수집 대상을 축소하지 않는다.
-- 자동 스케줄링, 일별 incremental refresh와 authoritative historical listing backfill은 아직
-  구현되지 않았다.
+- 이후 run-once refresh는 current catalog를 먼저 보존하고 source 관측 시점의 마지막 완결
+  minute까지 rolling window를 이동한다. successful evidence의 complement인 새 tail과 내부 gap만
+  순차 backfill하며 rolling window 밖의 canonical·evidence history는 삭제하지 않는다.
+- 자동 scheduler, authoritative historical listing backfill과 별도 research dataset 파이프라인은
+  아직 구현되지 않았다.
 - 최종 생존 종목 목록으로 과거를 필터링하지 않는다.
 - 상장폐지·유의·정지 종목과 실패한 데이터 구간을 역사에서 제거하지 않는다.
 - BTC·ETH를 포함한 fresh non-warning market 전체를 analysis universe에 유지한다. 향후 별도

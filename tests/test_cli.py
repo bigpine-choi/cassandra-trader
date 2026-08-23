@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from cassandra_trader.apps.liquidity_dataset_bootstrap import (
     LiquidityDatasetMarketResult,
     LiquidityDatasetMarketStatus,
 )
+from cassandra_trader.apps.liquidity_dataset_refresh import LiquidityDatasetRefreshStatus
 from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
     RuntimeRecoveryKind,
@@ -324,6 +326,95 @@ def test_bootstrap_liquidity_dataset_rejects_invalid_cli_input_before_service(
         unexpected_bootstrap,
     )
     command = _bootstrap_cli_args(tmp_path / "candles.db")
+    option = arguments[0]
+    index = command.index(option)
+    command[index : index + 2] = arguments
+
+    with pytest.raises(SystemExit) as error:
+        main(command)
+
+    assert error.value.code == 2
+    assert called is False
+
+
+def _refresh_cli_args(database: Path) -> list[str]:
+    return [
+        "refresh-liquidity-dataset",
+        "--quote-currency",
+        "KRW",
+        "--maximum-snapshot-age-seconds",
+        "3600",
+        "--database",
+        str(database),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    [
+        (LiquidityDatasetRefreshStatus.SUCCEEDED, 0),
+        (LiquidityDatasetRefreshStatus.PARTIAL_FAILURE, 1),
+        (LiquidityDatasetRefreshStatus.CATALOG_FAILED, 1),
+        (LiquidityDatasetRefreshStatus.UNRESOLVED, 2),
+    ],
+)
+def test_refresh_liquidity_dataset_outputs_jsonl_summary_last_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    status: LiquidityDatasetRefreshStatus,
+    expected_exit: int,
+) -> None:
+    markets = (
+        SimpleNamespace(market="KRW-BTC"),
+        SimpleNamespace(market="KRW-ETH"),
+    )
+    result = SimpleNamespace(markets=markets, summary=SimpleNamespace(status=status))
+
+    async def fake_refresh(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr("cassandra_trader.cli.refresh_liquidity_dataset", fake_refresh)
+    monkeypatch.setattr(
+        "cassandra_trader.cli.refresh_market_payload",
+        lambda item: {"type": "market", "market": item.market},
+    )
+    monkeypatch.setattr(
+        "cassandra_trader.cli.refresh_summary_payload",
+        lambda summary: {"type": "summary", "status": summary.status.value},
+    )
+
+    exit_code = main(_refresh_cli_args(tmp_path / "candles.db"))
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    assert exit_code == expected_exit
+    assert [record.get("market") for record in records[:-1]] == ["KRW-BTC", "KRW-ETH"]
+    assert records[-1] == {"type": "summary", "status": status.value}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--quote-currency", "BTC"],
+        ["--maximum-snapshot-age-seconds", "0"],
+        ["--maximum-snapshot-age-seconds", "nan"],
+        ["--maximum-snapshot-age-seconds", "999999999999999999999999999999"],
+    ],
+)
+def test_refresh_liquidity_dataset_rejects_invalid_input_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    async def unexpected_refresh(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid CLI input must not reach the service")
+
+    monkeypatch.setattr("cassandra_trader.cli.refresh_liquidity_dataset", unexpected_refresh)
+    command = _refresh_cli_args(tmp_path / "candles.db")
     option = arguments[0]
     index = command.index(option)
     command[index : index + 2] = arguments
