@@ -15,6 +15,7 @@ from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
     run_market_data,
 )
+from cassandra_trader.apps.market_eligibility import evaluate_market_eligibility_as_of
 from cassandra_trader.apps.market_universe import (
     capture_krw_market_catalog,
     resolve_market_universe_as_of,
@@ -33,6 +34,7 @@ from cassandra_trader.apps.multi_market_dataset import (
 from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 from cassandra_trader.domain.market import MarketUniverseStatus, normalize_quote_currency
+from cassandra_trader.domain.market_eligibility import MarketEligibilityEvaluationStatus
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
 
 
@@ -41,6 +43,17 @@ def _positive_integer(value: str) -> int:
 
     if number < 1:
         raise argparse.ArgumentTypeError("value must be at least 1")
+
+    return number
+
+
+def _positive_timedelta_seconds(value: str) -> int:
+    number = _positive_integer(value)
+
+    try:
+        timedelta(seconds=number)
+    except OverflowError as error:
+        raise argparse.ArgumentTypeError("value exceeds the supported duration range") from error
 
     return number
 
@@ -171,6 +184,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="UTC information cutoff in ISO 8601 format",
     )
     universe_as_of.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    eligible_markets = commands.add_parser(
+        "eligible-markets",
+        help="evaluate stored point-in-time catalog eligibility without network access",
+    )
+    eligible_markets.add_argument(
+        "--quote-currency",
+        type=_quote_currency,
+        default="KRW",
+        help="ASCII quote currency (default: KRW)",
+    )
+    eligible_markets.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC information cutoff in ISO 8601 format",
+    )
+    eligible_markets.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    eligible_markets.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -427,6 +469,58 @@ def _print_universe_as_of(
     return 2 if result.status is MarketUniverseStatus.UNRESOLVED else 0
 
 
+def _print_eligible_markets(
+    quote_currency: str,
+    as_of: datetime,
+    maximum_snapshot_age_seconds: int,
+    database: Path,
+) -> int:
+    result = evaluate_market_eligibility_as_of(
+        quote_currency,
+        as_of,
+        database,
+        timedelta(seconds=maximum_snapshot_age_seconds),
+    )
+
+    for decision in result.decisions:
+        payload = {
+            "type": "market",
+            "market": decision.market,
+            "status": decision.status.value,
+            "reasons": [reason.value for reason in decision.reasons],
+            "is_warning": decision.is_warning,
+        }
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    summary = {
+        "type": "summary",
+        "status": result.status.value,
+        "reasons": [reason.value for reason in result.reasons],
+        "policy_name": result.policy_name,
+        "policy_version": result.policy_version,
+        "quote_currency": result.quote_currency,
+        "as_of": _optional_utc_text(result.as_of),
+        "maximum_snapshot_age_seconds": _duration_seconds(result.maximum_snapshot_age),
+        "snapshot_id": result.snapshot_id,
+        "observed_at": (
+            None if result.observed_at is None else _optional_utc_text(result.observed_at)
+        ),
+        "available_at": (
+            None if result.available_at is None else _optional_utc_text(result.available_at)
+        ),
+        "content_hash": result.content_hash,
+        "snapshot_age_seconds": (
+            None if result.snapshot_age is None else _duration_seconds(result.snapshot_age)
+        ),
+        "candidate_count": result.candidate_count,
+        "eligible_count": result.eligible_count,
+        "excluded_count": result.excluded_count,
+        "unresolved_count": result.unresolved_count,
+    }
+    print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    return 2 if result.status is MarketEligibilityEvaluationStatus.UNRESOLVED else 0
+
+
 async def _print_candles(market: str, count: int) -> None:
     candles = await fetch_recent_minute_candles(market, count)
 
@@ -490,6 +584,15 @@ def _optional_utc_text(value: datetime | None) -> str:
         return "None"
 
     return value.isoformat().replace("+00:00", "Z")
+
+
+def _duration_seconds(value: timedelta) -> int | float:
+    microseconds = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+
+    if microseconds % 1_000_000 == 0:
+        return microseconds // 1_000_000
+
+    return microseconds / 1_000_000
 
 
 async def _stream_public(markets: list[str], max_events: int | None) -> int:
@@ -692,6 +795,14 @@ def main(argv: Sequence[str] | None = None) -> int | None:
         return _print_universe_as_of(
             arguments.quote_currency,
             arguments.as_of,
+            arguments.database,
+        )
+
+    if arguments.command == "eligible-markets":
+        return _print_eligible_markets(
+            arguments.quote_currency,
+            arguments.as_of,
+            arguments.maximum_snapshot_age_seconds,
             arguments.database,
         )
 
