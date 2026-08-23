@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from cassandra_trader.adapters.storage.sqlite import SqliteMinuteCandleRepository
 from cassandra_trader.apps.market_universe import resolve_market_universe_as_of
 from cassandra_trader.domain.market import normalize_quote_currency
 from cassandra_trader.domain.market_eligibility import (
@@ -17,6 +18,8 @@ def evaluate_market_eligibility_as_of(
     as_of: datetime,
     database: str | Path,
     maximum_snapshot_age: timedelta,
+    *,
+    repository: SqliteMinuteCandleRepository | None = None,
 ) -> MarketEligibilityResult:
     """Resolve stored universe evidence and apply catalog eligibility without network I/O."""
 
@@ -27,5 +30,10 @@ def evaluate_market_eligibility_as_of(
         raise ValueError("as_of must be timezone-aware UTC")
 
     cutoff = as_of.astimezone(UTC)
-    universe = resolve_market_universe_as_of(normalized_quote, cutoff, database)
+    universe = resolve_market_universe_as_of(
+        normalized_quote,
+        cutoff,
+        database,
+        repository=repository,
+    )
     return evaluate_market_eligibility(universe, maximum_snapshot_age)

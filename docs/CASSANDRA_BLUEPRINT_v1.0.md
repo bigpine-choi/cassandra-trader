@@ -229,6 +229,8 @@ flowchart TD
 
 fresh catalog eligibility의 `ELIGIBLE` market에는 point-in-time trailing 30-day KRW quote-volume metric을 계산한다. 정확한 UTC 43,200분의 모든 slot이 `TRADED` 또는 `NO_TRADE`로 resolved된 후보만 volume을 제공하고, 후보 하나라도 unresolved이면 전체 rank를 생성하지 않는다. warning market은 upstream에서 제외된다.
 
+trailing liquidity 계산 전 데이터 구축은 resumable liquidity dataset bootstrap이 담당한다. 명시적 `universe_as_of`의 fresh non-warning analysis universe 전체를 market code 순으로 처리하고, 각 market의 정확한 `[window_end - 30 days, window_end)` 43,200 slot을 실행 시작의 `resume_as_of`로 요약한다. 이미 모두 resolved된 market은 REST 호출 없이 건너뛰고 incomplete market만 동일한 전체 bounded range를 재실행한다. successful evidence와 canonical revision이 checkpoint이며 별도 mutable checkpoint나 top-N 기반 대상 축소를 만들지 않는다.
+
 versioned liquidity top-N policy는 완결된 upstream ordinal rank와 호출자가 명시한 N만 사용한다. rank가 N 이하면 `SELECTED`, 그 밖은 `OUTSIDE_TOP_N`으로 `EXCLUDED`하며 동률 종목을 N 밖에서 추가하지 않는다. upstream liquidity가 `UNRESOLVED`이면 일부 volume이 있더라도 모든 존재 후보를 `UNRESOLVED`로 두고 partial selection을 금지한다. 이 결과는 상장기간 심사 전 execution shortlist이며 최종 투자 유니버스나 매수 신호가 아니다.
 
 `/v1/market/all`의 현재 목록을 과거로 소급하지 않고 최초 성공 snapshot 이전은 `UNRESOLVED`로 둔다. current listing이나 candle history로 listing age를 합성하지 않으며, 상장 후 90일 정책과 공지사항 등 authoritative source에 근거한 과거 상장·폐지 이력 backfill은 아직 구현되지 않았다.
@@ -442,6 +444,7 @@ stateDiagram-v2
 | Backfill Evidence | bounded REST 조회 범위, 관측·가용 시각, 성공·실패 결과 | append-only, point-in-time 판정 근거 |
 | Market Catalog Snapshot | 현재 페어 목록과 warning metadata, 성공·실패 관측 | append-only, complete snapshot 단위 point-in-time membership 근거 |
 | Catalog Eligibility | point-in-time snapshot freshness와 warning 판정 | 비영속 versioned policy 결과, 유동성 심사 전 후보 |
+| Liquidity Dataset Bootstrap | fresh non-warning analysis universe 전체의 정확한 30일 minute data 구축 | canonical·successful evidence 기반 재개, market별 순차 bounded backfill |
 | Liquidity Evaluation | 30일 43,200 minute slot의 KRW quote volume과 결정론적 rank | 비영속 point-in-time 결과, 전체 후보 완결 시에만 rank |
 | Canonical | 실시간 ticker, canonical 1분봉, 선별 trade·orderbook, market status | 스키마 버전·품질 플래그 |
 | Derived Bar | point-in-time minute slot에서 실제 거래 분봉만 집계한 4시간봉 | UTC 경계, slot 상태·구성 1분봉과 품질 계보 |
@@ -460,6 +463,8 @@ canonical 1분봉을 기본 시계열 데이터로 삼고, 결측·중복·무�
 catalog eligibility는 선택된 universe를 재사용하며 네트워크나 current catalog로 fallback하지 않는다. freshness는 `as_of - observed_at`이고 maximum age는 실행마다 명시한다. age가 maximum 이하인 fresh snapshot에서 warning market만 제외하며, snapshot 부재나 stale snapshot은 모두 fail-closed `UNRESOLVED`다. 이 결과는 영속화하지 않고 정책 이름·버전·maximum age와 snapshot metadata를 함께 반환한다. `ELIGIBLE`은 최근 30일 유동성·liquidity top-N shortlist·상장 후 90일 심사를 통과했다는 뜻이 아니다.
 
 trailing liquidity는 catalog-level `ELIGIBLE` market에만 정확한 UTC `[window_end - 30 days, window_end)`를 적용한다. canonical과 successful backfill evidence를 `as_of` 기준으로 결합해 43,200개 slot이 모두 resolved된 market만 실제 `TRADED` candle의 KRW `quote_volume`을 합산한다. `NO_TRADE` candle을 합성하거나 forward-fill하지 않으며, unresolved slot이 있는 partial volume은 rank에 사용하지 않는다. 모든 후보가 resolved일 때만 volume 내림차순·market code 오름차순 tie-break로 ordinal rank를 만들고, 결과 tuple 자체는 market code 순서를 유지한다.
+
+resumable bootstrap은 이 조회의 선행 데이터 구축 도구다. stale 또는 unresolved catalog는 candle 조회와 네트워크 전에 fail-closed하며, fresh all-warning catalog는 대상 0개의 정상 완료다. 하나의 public client와 SQLite repository를 재사용해 market별·page별 순차 처리하고, transient timeout·connection·HTTP 429·5xx만 bounded exponential backoff와 `Retry-After` 한도 안에서 retry한다. 실패한 market의 이미 저장된 canonical은 보존하지만 FAILED evidence로 absence를 확정하지 않는다. 자동 스케줄링과 일별 incremental refresh는 아직 구현되지 않았다.
 
 liquidity top-N은 이 point-in-time rank를 다시 계산하지 않고 그대로 재사용하는 read-only policy다. 결과와 JSONL은 market code 순서를 유지하고 정책·catalog·snapshot·window metadata를 보존한다. upstream 전체가 resolved일 때만 N 이내를 선별하며, unresolved upstream에는 selection이나 partial rank를 만들지 않는다. 초기 execution shortlist 설정은 명시적 `top_n=100`이고 코드에 하드코딩하지 않는다. 이 shortlist는 analysis universe를 제한하지 않으며 synthetic candle, forward-fill, 결과 영속화를 수행하지 않고 아직 signal·portfolio·execution에 연결하지 않는다.
 
@@ -773,9 +778,9 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
 | 파생 봉 | point-in-time minute slot 240개를 resolve해 `COMPLETE`·`NO_TRADE`·`INCOMPLETE`를 구분하고, `COMPLETE`에는 실제 `TRADED` 분봉만 집계 |
 | 실시간 reconciliation | 기동 lookback과 각 완결 분에 REST를 다시 조회해 WebSocket 관측을 canonical 저장소와 대사하고 신규·수정·동일 revision을 구분 |
-| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity·top-N 평가, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
+| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity·top-N 평가, resumable 전체 analysis-universe bootstrap, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
 | 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |
-| 미구현 | authoritative 과거 상장·폐지 이력 backfill, 자동 30일 데이터 backfill, 상장 후 90일을 결합한 최종 투자 universe, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
+| 미구현 | authoritative 과거 상장·폐지 이력 backfill, bootstrap 자동 스케줄링·일별 incremental refresh, 상장 후 90일을 결합한 최종 투자 universe, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
 
 현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical, bounded backfill evidence와 market catalog snapshot만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. coverage의 `absent_slots` 자체는 중립적 관측 부재이고, 성공한 범위 증거와 결합된 resolver만 `NO_TRADE`를 판정한다.
 
@@ -816,7 +821,8 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 9. 완료: snapshot freshness와 warning 기반의 versioned catalog eligibility gate
 10. 완료: 전체 후보 완결성을 요구하는 trailing 30-day KRW quote-volume metric과 rank
 11. 완료: 완결된 point-in-time liquidity rank를 재사용하는 versioned top-N shortlist
-12. 이후 로드맵: authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
+12. 완료: fresh non-warning analysis universe 전체의 resumable 30일 liquidity dataset bootstrap
+13. 이후 로드맵: authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
 
 이 top-N은 상장 이력 심사 전 liquidity shortlist다. 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 authoritative listing history와 상장 후 90일 심사, 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
 

@@ -140,13 +140,21 @@ def resolve_market_universe_as_of(
     quote_currency: str,
     as_of: datetime,
     database: str | Path,
+    *,
+    repository: SqliteMinuteCandleRepository | None = None,
 ) -> MarketUniverseResult:
     """Resolve a universe from complete snapshots available by one cutoff."""
 
     normalized_quote = normalize_quote_currency(quote_currency)
     cutoff = _require_utc(as_of, "as_of")
 
-    with SqliteMinuteCandleRepository(database) as repository:
+    if repository is None:
+        with SqliteMinuteCandleRepository(database) as opened_repository:
+            snapshot = opened_repository.get_market_catalog_snapshot_as_of(
+                normalized_quote,
+                cutoff,
+            )
+    else:
         snapshot = repository.get_market_catalog_snapshot_as_of(normalized_quote, cutoff)
 
     if snapshot is None:
