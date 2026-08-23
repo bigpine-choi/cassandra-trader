@@ -12,8 +12,9 @@ from pathlib import Path
 
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.market import TradingPair, normalize_quote_currency
+from cassandra_trader.domain.microstructure import OrderbookEvent, TradeEvent
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _SCHEMA_V1_SQL = """
 CREATE TABLE raw_ingestion_batches (
     batch_id TEXT PRIMARY KEY,
@@ -277,10 +278,358 @@ BEGIN
 END;
 """
 
+_SCHEMA_V4_SQL = """
+CREATE TABLE microstructure_capture_sessions (
+    session_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    quote_currency TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    lookback_microseconds TEXT NOT NULL,
+    maximum_snapshot_age_microseconds TEXT NOT NULL,
+    top_n INTEGER NOT NULL CHECK (top_n >= 1),
+    top_n_policy_name TEXT NOT NULL,
+    top_n_policy_version TEXT NOT NULL,
+    liquidity_policy_name TEXT NOT NULL,
+    liquidity_policy_version TEXT NOT NULL,
+    catalog_policy_name TEXT NOT NULL,
+    catalog_policy_version TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    snapshot_observed_at TEXT NOT NULL,
+    snapshot_available_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    catalog_candidate_count INTEGER NOT NULL CHECK (catalog_candidate_count >= 0),
+    catalog_excluded_count INTEGER NOT NULL CHECK (catalog_excluded_count >= 0),
+    liquidity_candidate_count INTEGER NOT NULL CHECK (liquidity_candidate_count >= 0),
+    liquidity_resolved_count INTEGER NOT NULL CHECK (liquidity_resolved_count >= 0),
+    liquidity_unresolved_count INTEGER NOT NULL CHECK (liquidity_unresolved_count >= 0),
+    selected_count INTEGER NOT NULL CHECK (selected_count >= 0),
+    orderbook_units INTEGER NOT NULL CHECK (orderbook_units IN (1, 5, 15, 30)),
+    requested_duration_microseconds TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    CHECK (length(trim(session_id)) > 0),
+    CHECK (length(trim(source)) > 0),
+    CHECK (window_start < window_end),
+    CHECK (length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK (catalog_excluded_count <= catalog_candidate_count),
+    CHECK (liquidity_resolved_count + liquidity_unresolved_count = liquidity_candidate_count),
+    CHECK (selected_count <= liquidity_candidate_count),
+    CHECK (
+        length(snapshot_observed_at) = 27
+        AND length(snapshot_available_at) = 27
+        AND length(as_of) = 27
+        AND length(started_at) = 27
+    ),
+    CHECK (snapshot_observed_at <= snapshot_available_at),
+    CHECK (snapshot_available_at <= as_of),
+    CHECK (as_of <= started_at)
+);
+
+CREATE TABLE microstructure_capture_session_markets (
+    session_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    liquidity_rank INTEGER NOT NULL CHECK (liquidity_rank >= 1),
+    quote_volume TEXT NOT NULL,
+    PRIMARY KEY (session_id, market),
+    UNIQUE (session_id, liquidity_rank),
+    FOREIGN KEY (session_id) REFERENCES microstructure_capture_sessions(session_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE microstructure_connection_lifecycle_events (
+    lifecycle_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES microstructure_capture_sessions(session_id),
+    lifecycle_ordinal INTEGER NOT NULL CHECK (lifecycle_ordinal >= 1),
+    status TEXT NOT NULL CHECK (status IN ('CONNECTED', 'DISCONNECTED', 'RECONNECTING')),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    delay_seconds TEXT,
+    detail TEXT,
+    observed_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    UNIQUE (session_id, lifecycle_ordinal),
+    CHECK (length(observed_at) = 27 AND length(available_at) = 27),
+    CHECK (observed_at <= available_at),
+    CHECK (
+        (status = 'RECONNECTING' AND delay_seconds IS NOT NULL)
+        OR (status != 'RECONNECTING' AND delay_seconds IS NULL)
+    )
+);
+
+CREATE TABLE microstructure_raw_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES microstructure_capture_sessions(session_id),
+    receive_ordinal INTEGER NOT NULL CHECK (receive_ordinal >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN ('TRADE', 'ORDERBOOK')),
+    market TEXT NOT NULL,
+    source_timestamp TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    raw_payload BLOB NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    is_duplicate INTEGER NOT NULL CHECK (is_duplicate IN (0, 1)),
+    UNIQUE (session_id, receive_ordinal),
+    CHECK (length(trim(event_id)) > 0),
+    CHECK (length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(observed_at) = 27 AND length(available_at) = 27),
+    CHECK (observed_at <= available_at),
+    FOREIGN KEY (session_id, market)
+        REFERENCES microstructure_capture_session_markets(session_id, market)
+);
+
+CREATE TABLE microstructure_trade_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES microstructure_capture_sessions(session_id),
+    market TEXT NOT NULL,
+    trade_price TEXT NOT NULL,
+    trade_volume TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('ASK', 'BID')),
+    trade_timestamp TEXT NOT NULL,
+    message_timestamp TEXT NOT NULL,
+    sequential_id INTEGER NOT NULL CHECK (sequential_id >= 0),
+    best_ask_price TEXT NOT NULL,
+    best_ask_size TEXT NOT NULL,
+    best_bid_price TEXT NOT NULL,
+    best_bid_size TEXT NOT NULL,
+    stream_type TEXT NOT NULL CHECK (stream_type IN ('SNAPSHOT', 'REALTIME')),
+    FOREIGN KEY (event_id) REFERENCES microstructure_raw_events(event_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE microstructure_orderbook_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES microstructure_capture_sessions(session_id),
+    market TEXT NOT NULL,
+    message_timestamp TEXT NOT NULL,
+    total_ask_size TEXT NOT NULL,
+    total_bid_size TEXT NOT NULL,
+    grouping_level TEXT NOT NULL,
+    stream_type TEXT NOT NULL CHECK (stream_type IN ('SNAPSHOT', 'REALTIME')),
+    unit_count INTEGER NOT NULL CHECK (unit_count >= 1),
+    FOREIGN KEY (event_id) REFERENCES microstructure_raw_events(event_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE microstructure_orderbook_levels (
+    event_id TEXT NOT NULL,
+    level_ordinal INTEGER NOT NULL CHECK (level_ordinal >= 0),
+    ask_price TEXT NOT NULL,
+    bid_price TEXT NOT NULL,
+    ask_size TEXT NOT NULL,
+    bid_size TEXT NOT NULL,
+    PRIMARY KEY (event_id, level_ordinal),
+    FOREIGN KEY (event_id) REFERENCES microstructure_orderbook_events(event_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE microstructure_capture_terminals (
+    session_id TEXT PRIMARY KEY REFERENCES microstructure_capture_sessions(session_id),
+    status TEXT NOT NULL CHECK (status IN ('COMPLETED', 'FAILED', 'CANCELLED')),
+    ended_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    elapsed_seconds TEXT NOT NULL,
+    received_trade_count INTEGER NOT NULL CHECK (received_trade_count >= 0),
+    persisted_trade_count INTEGER NOT NULL CHECK (persisted_trade_count >= 0),
+    received_orderbook_count INTEGER NOT NULL CHECK (received_orderbook_count >= 0),
+    persisted_orderbook_count INTEGER NOT NULL CHECK (persisted_orderbook_count >= 0),
+    duplicate_count INTEGER NOT NULL CHECK (duplicate_count >= 0),
+    lifecycle_count INTEGER NOT NULL CHECK (lifecycle_count >= 0),
+    reconnect_count INTEGER NOT NULL CHECK (reconnect_count >= 0),
+    error_type TEXT,
+    error_message TEXT,
+    CHECK (length(ended_at) = 27 AND length(available_at) = 27),
+    CHECK (ended_at <= available_at),
+    CHECK (received_trade_count >= persisted_trade_count),
+    CHECK (received_orderbook_count >= persisted_orderbook_count),
+    CHECK (
+        (status = 'COMPLETED' AND error_type IS NULL AND error_message IS NULL)
+        OR (
+            status IN ('FAILED', 'CANCELLED')
+            AND error_type IS NOT NULL
+            AND length(trim(error_type)) > 0
+        )
+    )
+);
+
+CREATE INDEX microstructure_raw_session_ordinal
+ON microstructure_raw_events (session_id, receive_ordinal);
+CREATE INDEX microstructure_raw_session_payload
+ON microstructure_raw_events (session_id, payload_sha256);
+CREATE INDEX microstructure_raw_market_source_time
+ON microstructure_raw_events (market, source_timestamp, session_id, receive_ordinal);
+CREATE INDEX microstructure_trade_sequential
+ON microstructure_trade_events (market, sequential_id, session_id);
+CREATE INDEX microstructure_lifecycle_session
+ON microstructure_connection_lifecycle_events (session_id, lifecycle_ordinal);
+
+CREATE TRIGGER microstructure_sessions_validate_markets
+BEFORE INSERT ON microstructure_capture_sessions
+WHEN (
+    SELECT COUNT(*) FROM microstructure_capture_session_markets
+    WHERE session_id = NEW.session_id
+) != NEW.selected_count
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure session selection count mismatch');
+END;
+
+CREATE TRIGGER microstructure_session_markets_no_late_insert
+BEFORE INSERT ON microstructure_capture_session_markets
+WHEN EXISTS (
+    SELECT 1 FROM microstructure_capture_sessions WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure session selection is sealed');
+END;
+
+CREATE TRIGGER microstructure_orderbooks_validate_levels
+BEFORE INSERT ON microstructure_orderbook_events
+WHEN (
+    SELECT COUNT(*) FROM microstructure_orderbook_levels WHERE event_id = NEW.event_id
+) != NEW.unit_count
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure orderbook level count mismatch');
+END;
+
+CREATE TRIGGER microstructure_orderbook_levels_no_late_insert
+BEFORE INSERT ON microstructure_orderbook_levels
+WHEN EXISTS (
+    SELECT 1 FROM microstructure_orderbook_events WHERE event_id = NEW.event_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure orderbook levels are sealed');
+END;
+
+CREATE TRIGGER microstructure_raw_validate_child
+BEFORE INSERT ON microstructure_raw_events
+WHEN (
+    NEW.event_type = 'TRADE' AND (
+        (SELECT COUNT(*) FROM microstructure_trade_events WHERE event_id = NEW.event_id) != 1
+        OR EXISTS (SELECT 1 FROM microstructure_orderbook_events WHERE event_id = NEW.event_id)
+        OR EXISTS (
+            SELECT 1 FROM microstructure_trade_events
+            WHERE event_id = NEW.event_id
+              AND (session_id != NEW.session_id OR market != NEW.market
+                   OR message_timestamp != NEW.source_timestamp)
+        )
+    )
+) OR (
+    NEW.event_type = 'ORDERBOOK' AND (
+        (SELECT COUNT(*) FROM microstructure_orderbook_events WHERE event_id = NEW.event_id) != 1
+        OR EXISTS (SELECT 1 FROM microstructure_trade_events WHERE event_id = NEW.event_id)
+        OR EXISTS (
+            SELECT 1 FROM microstructure_orderbook_events
+            WHERE event_id = NEW.event_id
+              AND (session_id != NEW.session_id OR market != NEW.market
+                   OR message_timestamp != NEW.source_timestamp)
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure raw event child contract violated');
+END;
+
+CREATE TRIGGER microstructure_trade_no_late_insert
+BEFORE INSERT ON microstructure_trade_events
+WHEN EXISTS (SELECT 1 FROM microstructure_raw_events WHERE event_id = NEW.event_id)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure raw event is sealed');
+END;
+
+CREATE TRIGGER microstructure_orderbook_no_late_insert
+BEFORE INSERT ON microstructure_orderbook_events
+WHEN EXISTS (SELECT 1 FROM microstructure_raw_events WHERE event_id = NEW.event_id)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure raw event is sealed');
+END;
+
+CREATE TRIGGER microstructure_terminal_validate_counts
+BEFORE INSERT ON microstructure_capture_terminals
+WHEN
+    NEW.ended_at < (
+        SELECT started_at FROM microstructure_capture_sessions WHERE session_id = NEW.session_id
+    )
+    OR
+    NEW.persisted_trade_count != (
+        SELECT COUNT(*) FROM microstructure_raw_events
+        WHERE session_id = NEW.session_id AND event_type = 'TRADE'
+    )
+    OR NEW.persisted_orderbook_count != (
+        SELECT COUNT(*) FROM microstructure_raw_events
+        WHERE session_id = NEW.session_id AND event_type = 'ORDERBOOK'
+    )
+    OR NEW.duplicate_count != (
+        SELECT COUNT(*) FROM microstructure_raw_events
+        WHERE session_id = NEW.session_id AND is_duplicate = 1
+    )
+    OR NEW.lifecycle_count != (
+        SELECT COUNT(*) FROM microstructure_connection_lifecycle_events
+        WHERE session_id = NEW.session_id
+    )
+    OR NEW.reconnect_count != (
+        SELECT COUNT(*) FROM microstructure_connection_lifecycle_events
+        WHERE session_id = NEW.session_id AND status = 'RECONNECTING'
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure terminal counts do not match persisted observations');
+END;
+
+CREATE TRIGGER microstructure_lifecycle_no_insert_after_terminal
+BEFORE INSERT ON microstructure_connection_lifecycle_events
+WHEN EXISTS (
+    SELECT 1 FROM microstructure_capture_terminals WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure session is terminal');
+END;
+
+CREATE TRIGGER microstructure_raw_no_insert_after_terminal
+BEFORE INSERT ON microstructure_raw_events
+WHEN EXISTS (
+    SELECT 1 FROM microstructure_capture_terminals WHERE session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'microstructure session is terminal');
+END;
+
+CREATE TRIGGER microstructure_sessions_no_update BEFORE UPDATE ON microstructure_capture_sessions
+BEGIN SELECT RAISE(ABORT, 'microstructure sessions are append-only'); END;
+CREATE TRIGGER microstructure_sessions_no_delete BEFORE DELETE ON microstructure_capture_sessions
+BEGIN SELECT RAISE(ABORT, 'microstructure sessions are append-only'); END;
+CREATE TRIGGER microstructure_session_markets_no_update BEFORE UPDATE ON microstructure_capture_session_markets
+BEGIN SELECT RAISE(ABORT, 'microstructure session markets are append-only'); END;
+CREATE TRIGGER microstructure_session_markets_no_delete BEFORE DELETE ON microstructure_capture_session_markets
+BEGIN SELECT RAISE(ABORT, 'microstructure session markets are append-only'); END;
+CREATE TRIGGER microstructure_lifecycle_no_update BEFORE UPDATE ON microstructure_connection_lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'microstructure lifecycle is append-only'); END;
+CREATE TRIGGER microstructure_lifecycle_no_delete BEFORE DELETE ON microstructure_connection_lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'microstructure lifecycle is append-only'); END;
+CREATE TRIGGER microstructure_raw_no_update BEFORE UPDATE ON microstructure_raw_events
+BEGIN SELECT RAISE(ABORT, 'microstructure raw events are append-only'); END;
+CREATE TRIGGER microstructure_raw_no_delete BEFORE DELETE ON microstructure_raw_events
+BEGIN SELECT RAISE(ABORT, 'microstructure raw events are append-only'); END;
+CREATE TRIGGER microstructure_trade_no_update BEFORE UPDATE ON microstructure_trade_events
+BEGIN SELECT RAISE(ABORT, 'microstructure trades are append-only'); END;
+CREATE TRIGGER microstructure_trade_no_delete BEFORE DELETE ON microstructure_trade_events
+BEGIN SELECT RAISE(ABORT, 'microstructure trades are append-only'); END;
+CREATE TRIGGER microstructure_orderbook_no_update BEFORE UPDATE ON microstructure_orderbook_events
+BEGIN SELECT RAISE(ABORT, 'microstructure orderbooks are append-only'); END;
+CREATE TRIGGER microstructure_orderbook_no_delete BEFORE DELETE ON microstructure_orderbook_events
+BEGIN SELECT RAISE(ABORT, 'microstructure orderbooks are append-only'); END;
+CREATE TRIGGER microstructure_levels_no_update BEFORE UPDATE ON microstructure_orderbook_levels
+BEGIN SELECT RAISE(ABORT, 'microstructure orderbook levels are append-only'); END;
+CREATE TRIGGER microstructure_levels_no_delete BEFORE DELETE ON microstructure_orderbook_levels
+BEGIN SELECT RAISE(ABORT, 'microstructure orderbook levels are append-only'); END;
+CREATE TRIGGER microstructure_terminals_no_update BEFORE UPDATE ON microstructure_capture_terminals
+BEGIN SELECT RAISE(ABORT, 'microstructure terminals are append-only'); END;
+CREATE TRIGGER microstructure_terminals_no_delete BEFORE DELETE ON microstructure_capture_terminals
+BEGIN SELECT RAISE(ABORT, 'microstructure terminals are append-only'); END;
+"""
+
 _MIGRATIONS = (
     (1, _SCHEMA_V1_SQL),
     (2, _SCHEMA_V2_SQL),
     (3, _SCHEMA_V3_SQL),
+    (4, _SCHEMA_V4_SQL),
 )
 
 
@@ -402,6 +751,65 @@ class StoredMarketCatalogSnapshot:
         """Return snapshot pairs in deterministic market-code order."""
 
         return tuple(member.pair for member in self.members)
+
+
+@dataclass(frozen=True, slots=True)
+class MicrostructureSessionMarketInput:
+    """One fixed point-in-time top-N session member."""
+
+    market: str
+    liquidity_rank: int
+    quote_volume: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class MicrostructureCaptureSessionInput:
+    """Immutable header metadata for one bounded recorder session."""
+
+    session_id: str
+    source: str
+    quote_currency: str
+    window_start: datetime
+    window_end: datetime
+    as_of: datetime
+    lookback: timedelta
+    maximum_snapshot_age: timedelta
+    top_n: int
+    top_n_policy_name: str
+    top_n_policy_version: str
+    liquidity_policy_name: str
+    liquidity_policy_version: str
+    catalog_policy_name: str
+    catalog_policy_version: str
+    snapshot_id: str
+    snapshot_observed_at: datetime
+    snapshot_available_at: datetime
+    content_hash: str
+    catalog_candidate_count: int
+    catalog_excluded_count: int
+    liquidity_candidate_count: int
+    liquidity_resolved_count: int
+    liquidity_unresolved_count: int
+    orderbook_units: int
+    requested_duration: timedelta
+    started_at: datetime
+
+
+class MicrostructureTerminalStatus(StrEnum):
+    """Terminal evidence for a bounded capture session."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+@dataclass(frozen=True, slots=True)
+class MicrostructureEventIngestionResult:
+    """Identity and duplicate flag for one committed raw observation."""
+
+    event_id: str
+    receive_ordinal: int
+    is_duplicate: bool
 
 
 class SqliteMinuteCandleRepository:
@@ -1034,6 +1442,411 @@ class SqliteMinuteCandleRepository:
             members=members,
         )
 
+    def create_microstructure_capture_session(
+        self,
+        session: MicrostructureCaptureSessionInput,
+        markets: Sequence[MicrostructureSessionMarketInput],
+    ) -> None:
+        """Atomically append and seal one fixed top-N capture session header."""
+
+        selected = tuple(markets)
+        if not session.session_id.strip() or not session.source.strip():
+            raise ValueError("session_id and source must not be empty")
+        if normalize_quote_currency(session.quote_currency) != "KRW":
+            raise ValueError("microstructure capture requires KRW quote currency")
+        if (
+            not isinstance(session.top_n, int)
+            or isinstance(session.top_n, bool)
+            or session.top_n < 1
+        ):
+            raise ValueError("top_n must be a positive integer")
+        if session.orderbook_units not in (1, 5, 15, 30) or isinstance(
+            session.orderbook_units, bool
+        ):
+            raise ValueError("orderbook_units must be one of 1, 5, 15, or 30")
+        if session.requested_duration <= timedelta(0):
+            raise ValueError("requested_duration must be positive")
+        if session.window_start >= session.window_end:
+            raise ValueError("window_start must be before window_end")
+        if not (
+            session.snapshot_observed_at
+            <= session.snapshot_available_at
+            <= session.as_of
+            <= session.started_at
+        ):
+            raise ValueError("session timestamps must be monotonically ordered")
+        if len(session.content_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in session.content_hash
+        ):
+            raise ValueError("content_hash must be lowercase SHA-256")
+        if selected != tuple(sorted(selected, key=lambda item: item.market)):
+            raise ValueError("selected markets must be ordered by market code")
+        if len({item.market for item in selected}) != len(selected):
+            raise ValueError("selected markets must not contain duplicates")
+        if len({item.liquidity_rank for item in selected}) != len(selected):
+            raise ValueError("selected liquidity ranks must not contain duplicates")
+        for item in selected:
+            quote, separator, base = item.market.partition("-")
+            if (
+                separator != "-"
+                or quote != "KRW"
+                or not base
+                or not quote.isascii()
+                or not base.isascii()
+                or not quote.isalnum()
+                or not base.isalnum()
+                or item.market != item.market.upper()
+            ):
+                raise ValueError("selected market must be an uppercase ASCII KRW market")
+            if (
+                not isinstance(item.liquidity_rank, int)
+                or isinstance(item.liquidity_rank, bool)
+                or not 1 <= item.liquidity_rank <= session.top_n
+            ):
+                raise ValueError("selected liquidity rank must be within top_n")
+            if (
+                not isinstance(item.quote_volume, Decimal)
+                or not item.quote_volume.is_finite()
+                or item.quote_volume < 0
+            ):
+                raise ValueError("selected quote volume must be finite and non-negative")
+
+        with self._connection:
+            for item in selected:
+                self._connection.execute(
+                    """
+                    INSERT INTO microstructure_capture_session_markets (
+                        session_id, market, liquidity_rank, quote_volume
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        session.session_id,
+                        item.market,
+                        item.liquidity_rank,
+                        _decimal_text(item.quote_volume),
+                    ),
+                )
+            self._connection.execute(
+                """
+                INSERT INTO microstructure_capture_sessions (
+                    session_id, source, quote_currency, window_start, window_end, as_of,
+                    lookback_microseconds, maximum_snapshot_age_microseconds,
+                    top_n, top_n_policy_name, top_n_policy_version,
+                    liquidity_policy_name, liquidity_policy_version,
+                    catalog_policy_name, catalog_policy_version,
+                    snapshot_id, snapshot_observed_at, snapshot_available_at, content_hash,
+                    catalog_candidate_count, catalog_excluded_count,
+                    liquidity_candidate_count, liquidity_resolved_count,
+                    liquidity_unresolved_count, selected_count, orderbook_units,
+                    requested_duration_microseconds, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.session_id,
+                    session.source,
+                    session.quote_currency,
+                    _utc_availability_text(session.window_start),
+                    _utc_availability_text(session.window_end),
+                    _utc_availability_text(session.as_of),
+                    _timedelta_microseconds_text(session.lookback),
+                    _timedelta_microseconds_text(session.maximum_snapshot_age),
+                    session.top_n,
+                    session.top_n_policy_name,
+                    session.top_n_policy_version,
+                    session.liquidity_policy_name,
+                    session.liquidity_policy_version,
+                    session.catalog_policy_name,
+                    session.catalog_policy_version,
+                    session.snapshot_id,
+                    _utc_availability_text(session.snapshot_observed_at),
+                    _utc_availability_text(session.snapshot_available_at),
+                    session.content_hash,
+                    session.catalog_candidate_count,
+                    session.catalog_excluded_count,
+                    session.liquidity_candidate_count,
+                    session.liquidity_resolved_count,
+                    session.liquidity_unresolved_count,
+                    len(selected),
+                    session.orderbook_units,
+                    _timedelta_microseconds_text(session.requested_duration),
+                    _utc_availability_text(session.started_at),
+                ),
+            )
+
+    def record_microstructure_lifecycle_event(
+        self,
+        *,
+        session_id: str,
+        lifecycle_ordinal: int,
+        status: str,
+        attempt: int,
+        delay_seconds: Decimal | None,
+        detail: str | None,
+        observed_at: datetime,
+        available_at: datetime,
+    ) -> None:
+        """Append one connection lifecycle observation."""
+
+        if (
+            not isinstance(lifecycle_ordinal, int)
+            or isinstance(lifecycle_ordinal, bool)
+            or lifecycle_ordinal < 1
+        ):
+            raise ValueError("lifecycle_ordinal must be a positive integer")
+        if status not in {"CONNECTED", "DISCONNECTED", "RECONNECTING"}:
+            raise ValueError("unsupported lifecycle status")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0:
+            raise ValueError("attempt must be a non-negative integer")
+        if (status == "RECONNECTING") != (delay_seconds is not None):
+            raise ValueError("only RECONNECTING lifecycle requires delay_seconds")
+        if delay_seconds is not None and (
+            not isinstance(delay_seconds, Decimal)
+            or not delay_seconds.is_finite()
+            or delay_seconds < 0
+        ):
+            raise ValueError("delay_seconds must be finite and non-negative")
+        if observed_at > available_at:
+            raise ValueError("observed_at must not be after available_at")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO microstructure_connection_lifecycle_events (
+                    session_id, lifecycle_ordinal, status, attempt, delay_seconds,
+                    detail, observed_at, available_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    lifecycle_ordinal,
+                    status,
+                    attempt,
+                    None if delay_seconds is None else _decimal_text(delay_seconds),
+                    detail,
+                    _utc_availability_text(observed_at),
+                    _utc_availability_text(available_at),
+                ),
+            )
+
+    def record_microstructure_event(
+        self,
+        *,
+        event_id: str,
+        session_id: str,
+        receive_ordinal: int,
+        raw_payload: bytes,
+        event: TradeEvent | OrderbookEvent,
+        available_at: datetime,
+    ) -> MicrostructureEventIngestionResult:
+        """Atomically append one raw envelope and its normalized child rows."""
+
+        if not event_id.strip():
+            raise ValueError("event_id must not be empty")
+        if (
+            not isinstance(receive_ordinal, int)
+            or isinstance(receive_ordinal, bool)
+            or receive_ordinal < 1
+        ):
+            raise ValueError("receive_ordinal must be a positive integer")
+        if not isinstance(raw_payload, bytes):
+            raise ValueError("raw_payload must be bytes")
+        if event.observed_at > available_at:
+            raise ValueError("observed_at must not be after available_at")
+        payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
+        source_timestamp = event.message_timestamp_utc
+
+        with self._connection:
+            duplicate_raw = self._connection.execute(
+                """
+                SELECT 1 FROM microstructure_raw_events
+                WHERE session_id = ? AND payload_sha256 = ? LIMIT 1
+                """,
+                (session_id, payload_sha256),
+            ).fetchone()
+            duplicate_trade = None
+            if isinstance(event, TradeEvent):
+                duplicate_trade = self._connection.execute(
+                    """
+                    SELECT 1 FROM microstructure_trade_events
+                    WHERE session_id = ? AND market = ? AND sequential_id = ? LIMIT 1
+                    """,
+                    (session_id, event.market, event.sequential_id),
+                ).fetchone()
+                self._insert_microstructure_trade(event_id, session_id, event)
+                event_type = "TRADE"
+            elif isinstance(event, OrderbookEvent):
+                self._insert_microstructure_orderbook(event_id, session_id, event)
+                event_type = "ORDERBOOK"
+            else:
+                raise ValueError("unsupported microstructure event")
+            is_duplicate = duplicate_raw is not None or duplicate_trade is not None
+            self._connection.execute(
+                """
+                INSERT INTO microstructure_raw_events (
+                    event_id, session_id, receive_ordinal, event_type, market,
+                    source_timestamp, observed_at, available_at, raw_payload,
+                    payload_sha256, is_duplicate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    session_id,
+                    receive_ordinal,
+                    event_type,
+                    event.market,
+                    _utc_availability_text(source_timestamp),
+                    _utc_availability_text(event.observed_at),
+                    _utc_availability_text(available_at),
+                    sqlite3.Binary(raw_payload),
+                    payload_sha256,
+                    int(is_duplicate),
+                ),
+            )
+        return MicrostructureEventIngestionResult(event_id, receive_ordinal, is_duplicate)
+
+    def _insert_microstructure_trade(
+        self,
+        event_id: str,
+        session_id: str,
+        event: TradeEvent,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO microstructure_trade_events (
+                event_id, session_id, market, trade_price, trade_volume, side,
+                trade_timestamp, message_timestamp, sequential_id,
+                best_ask_price, best_ask_size, best_bid_price, best_bid_size, stream_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                session_id,
+                event.market,
+                _decimal_text(event.trade_price),
+                _decimal_text(event.trade_volume),
+                event.side.value,
+                _utc_availability_text(event.trade_timestamp_utc),
+                _utc_availability_text(event.message_timestamp_utc),
+                event.sequential_id,
+                _decimal_text(event.best_ask_price),
+                _decimal_text(event.best_ask_size),
+                _decimal_text(event.best_bid_price),
+                _decimal_text(event.best_bid_size),
+                event.stream_type.value,
+            ),
+        )
+
+    def _insert_microstructure_orderbook(
+        self,
+        event_id: str,
+        session_id: str,
+        event: OrderbookEvent,
+    ) -> None:
+        for ordinal, unit in enumerate(event.units):
+            self._connection.execute(
+                """
+                INSERT INTO microstructure_orderbook_levels (
+                    event_id, level_ordinal, ask_price, bid_price, ask_size, bid_size
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    ordinal,
+                    _decimal_text(unit.ask_price),
+                    _decimal_text(unit.bid_price),
+                    _decimal_text(unit.ask_size),
+                    _decimal_text(unit.bid_size),
+                ),
+            )
+        self._connection.execute(
+            """
+            INSERT INTO microstructure_orderbook_events (
+                event_id, session_id, market, message_timestamp, total_ask_size,
+                total_bid_size, grouping_level, stream_type, unit_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                session_id,
+                event.market,
+                _utc_availability_text(event.message_timestamp_utc),
+                _decimal_text(event.total_ask_size),
+                _decimal_text(event.total_bid_size),
+                _decimal_text(event.grouping_level),
+                event.stream_type.value,
+                len(event.units),
+            ),
+        )
+
+    def record_microstructure_terminal(
+        self,
+        *,
+        session_id: str,
+        status: MicrostructureTerminalStatus,
+        ended_at: datetime,
+        available_at: datetime,
+        elapsed_seconds: Decimal,
+        received_trade_count: int,
+        persisted_trade_count: int,
+        received_orderbook_count: int,
+        persisted_orderbook_count: int,
+        duplicate_count: int,
+        lifecycle_count: int,
+        reconnect_count: int,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Append and validate one terminal session evidence row."""
+
+        normalized_status = MicrostructureTerminalStatus(status)
+        counts = (
+            received_trade_count,
+            persisted_trade_count,
+            received_orderbook_count,
+            persisted_orderbook_count,
+            duplicate_count,
+            lifecycle_count,
+            reconnect_count,
+        )
+        if any(
+            not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in counts
+        ):
+            raise ValueError("terminal counts must be non-negative integers")
+        if ended_at > available_at:
+            raise ValueError("ended_at must not be after available_at")
+        if (
+            not isinstance(elapsed_seconds, Decimal)
+            or not elapsed_seconds.is_finite()
+            or elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed_seconds must be finite and non-negative")
+        if normalized_status is MicrostructureTerminalStatus.COMPLETED:
+            if error_type is not None or error_message is not None:
+                raise ValueError("COMPLETED terminal must not contain an error")
+        elif not error_type or error_message is None:
+            raise ValueError("failed or cancelled terminal requires an error")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO microstructure_capture_terminals (
+                    session_id, status, ended_at, available_at, elapsed_seconds,
+                    received_trade_count, persisted_trade_count,
+                    received_orderbook_count, persisted_orderbook_count,
+                    duplicate_count, lifecycle_count, reconnect_count,
+                    error_type, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    normalized_status.value,
+                    _utc_availability_text(ended_at),
+                    _utc_availability_text(available_at),
+                    _decimal_text(elapsed_seconds),
+                    *counts,
+                    error_type,
+                    error_message,
+                ),
+            )
+
     def _migrate(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
 
@@ -1212,6 +2025,13 @@ def _decimal_text(value: Decimal) -> str:
         text = text.rstrip("0").rstrip(".")
 
     return text
+
+
+def _timedelta_microseconds_text(value: timedelta) -> str:
+    if not isinstance(value, timedelta) or value <= timedelta(0):
+        raise ValueError("duration must be a positive timedelta")
+    microseconds = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+    return str(microseconds)
 
 
 def _utc_text(value: datetime) -> str:

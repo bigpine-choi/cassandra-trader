@@ -156,7 +156,7 @@ def _table_count(database: Path, table: str) -> int:
         return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
-def test_new_database_applies_v1_through_v3_once(tmp_path: Path) -> None:
+def test_new_database_applies_v1_through_v4_once(tmp_path: Path) -> None:
     database = tmp_path / "catalog.db"
 
     with SqliteMinuteCandleRepository(database):
@@ -169,10 +169,10 @@ def test_new_database_applies_v1_through_v3_once(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
 
 
-def test_existing_v2_data_is_preserved_when_only_v3_is_applied(tmp_path: Path) -> None:
+def test_existing_v2_data_is_preserved_when_later_migrations_are_applied(tmp_path: Path) -> None:
     database = tmp_path / "legacy-v2.db"
     _create_v2_database(database)
 
@@ -189,7 +189,7 @@ def test_existing_v2_data_is_preserved_when_only_v3_is_applied(tmp_path: Path) -
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
 
 
 def test_success_snapshot_and_members_are_inserted_atomically(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +25,7 @@ from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryKind,
 )
 from cassandra_trader.apps.market_universe import MarketCatalogCaptureResult
+from cassandra_trader.apps.microstructure_recorder import MicrostructureCaptureStatus
 from cassandra_trader.apps.minute_candle_backfill import MinuteCandleBackfillResult
 from cassandra_trader.apps.minute_reconciliation import (
     MinuteReconciliationResult,
@@ -1653,6 +1655,168 @@ def test_liquidity_top_n_requires_top_n_before_service_or_database(
     assert error.value.code == 2
     assert called is False
     assert not database.exists()
+
+
+def _microstructure_args(database: Path) -> list[str]:
+    return [
+        "record-microstructure",
+        "--quote-currency",
+        "KRW",
+        "--window-end",
+        "2026-08-24T12:00:00Z",
+        "--as-of",
+        "2026-08-24T12:10:00Z",
+        "--maximum-snapshot-age-seconds",
+        "3600",
+        "--top-n",
+        "100",
+        "--duration-seconds",
+        "60",
+        "--orderbook-units",
+        "15",
+        "--database",
+        str(database),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    [
+        (MicrostructureCaptureStatus.COMPLETED, 0),
+        (MicrostructureCaptureStatus.FAILED, 1),
+        (MicrostructureCaptureStatus.UNRESOLVED, 2),
+    ],
+)
+def test_record_microstructure_outputs_market_order_then_summary_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    status: MicrostructureCaptureStatus,
+    expected_exit: int,
+) -> None:
+    markets = (
+        SimpleNamespace(
+            market="KRW-BTC",
+            liquidity_rank=1,
+            quote_volume=Decimal("20.000000000000000001"),
+        ),
+        SimpleNamespace(
+            market="KRW-ETH",
+            liquidity_rank=2,
+            quote_volume=Decimal("10.000000000000000002"),
+        ),
+    )
+    result = SimpleNamespace(status=status, markets=markets)
+
+    async def fake_record(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr("cassandra_trader.cli.record_microstructure", fake_record)
+    monkeypatch.setattr(
+        "cassandra_trader.cli.capture_market_payload",
+        lambda item: {
+            "type": "market",
+            "market": item.market,
+            "quote_volume": str(item.quote_volume),
+            "liquidity_rank": item.liquidity_rank,
+        },
+    )
+    monkeypatch.setattr(
+        "cassandra_trader.cli.capture_summary_payload",
+        lambda item: {"type": "summary", "status": item.status.value},
+    )
+
+    exit_code = main(_microstructure_args(tmp_path / "capture.db"))
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    assert exit_code == expected_exit
+    assert [record.get("market") for record in records[:-1]] == ["KRW-BTC", "KRW-ETH"]
+    assert records[0]["quote_volume"] == "20.000000000000000001"
+    assert records[-1] == {"type": "summary", "status": status.value}
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--quote-currency", "BTC"),
+        ("--window-end", "2026-08-24T12:00:00.000001Z"),
+        ("--as-of", "not-utc"),
+        ("--maximum-snapshot-age-seconds", "0"),
+        ("--top-n", "0"),
+        ("--duration-seconds", "0"),
+        ("--duration-seconds", "86401"),
+        ("--duration-seconds", "nan"),
+        ("--orderbook-units", "10"),
+    ],
+)
+def test_record_microstructure_rejects_invalid_input_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    option: str,
+    value: str,
+) -> None:
+    called = False
+
+    async def unexpected(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid input must not reach service")
+
+    monkeypatch.setattr("cassandra_trader.cli.record_microstructure", unexpected)
+    command = _microstructure_args(tmp_path / "missing.db")
+    index = command.index(option)
+    command[index + 1] = value
+
+    with pytest.raises(SystemExit) as error:
+        main(command)
+
+    assert error.value.code == 2
+    assert called is False
+
+
+def test_record_microstructure_rejects_as_of_before_window_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    async def unexpected(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("cassandra_trader.cli.record_microstructure", unexpected)
+    command = _microstructure_args(tmp_path / "missing.db")
+    command[command.index("--as-of") + 1] = "2026-08-24T11:59:59.999999Z"
+
+    with pytest.raises(SystemExit) as error:
+        main(command)
+
+    assert error.value.code == 2
+    assert called is False
+
+
+def test_record_microstructure_runtime_error_is_failed_summary_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    async def failing_record(*args, **kwargs):
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr("cassandra_trader.cli.record_microstructure", failing_record)
+
+    exit_code = main(_microstructure_args(tmp_path / "capture.db"))
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    assert exit_code == 1
+    assert records == [
+        {
+            "type": "summary",
+            "status": "FAILED",
+            "error_type": "OperationalError",
+            "error_message": "disk full",
+        }
+    ]
 
 
 def test_candles_command(
