@@ -10,6 +10,7 @@ from pathlib import Path
 
 from cassandra_trader.adapters.upbit.public_stream import StreamLifecycleEvent
 from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
+from cassandra_trader.apps.liquidity_top_n import evaluate_liquidity_top_n_as_of
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
 from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
@@ -34,6 +35,7 @@ from cassandra_trader.apps.multi_market_dataset import (
 )
 from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
+from cassandra_trader.domain.liquidity_top_n import LiquidityTopNEvaluationStatus
 from cassandra_trader.domain.market import MarketUniverseStatus, normalize_quote_currency
 from cassandra_trader.domain.market_eligibility import MarketEligibilityEvaluationStatus
 from cassandra_trader.domain.market_liquidity import MarketLiquidityEvaluationStatus
@@ -270,6 +272,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="positive maximum catalog snapshot age in seconds",
     )
     market_liquidity.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    liquidity_top_n = commands.add_parser(
+        "liquidity-top-n",
+        help="select a deterministic top-N from complete point-in-time liquidity ranks",
+    )
+    liquidity_top_n.add_argument(
+        "--quote-currency",
+        type=_krw_quote_currency,
+        required=True,
+        help="quote currency (must be KRW)",
+    )
+    liquidity_top_n.add_argument(
+        "--window-end",
+        type=_liquidity_window_end,
+        required=True,
+        help="exclusive UTC minute boundary for the 30-day window",
+    )
+    liquidity_top_n.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC information cutoff in ISO 8601 format",
+    )
+    liquidity_top_n.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    liquidity_top_n.add_argument(
+        "--top-n",
+        type=_positive_integer,
+        required=True,
+        help="positive number of liquidity-ranked markets to shortlist",
+    )
+    liquidity_top_n.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -640,6 +683,72 @@ def _print_market_liquidity(
     return 2 if result.status is MarketLiquidityEvaluationStatus.UNRESOLVED else 0
 
 
+def _print_liquidity_top_n(
+    quote_currency: str,
+    window_end: datetime,
+    as_of: datetime,
+    maximum_snapshot_age_seconds: int,
+    top_n: int,
+    database: Path,
+) -> int:
+    result = evaluate_liquidity_top_n_as_of(
+        quote_currency,
+        window_end,
+        as_of,
+        database,
+        timedelta(seconds=maximum_snapshot_age_seconds),
+        top_n,
+    )
+
+    for decision in result.decisions:
+        payload = {
+            "type": "market",
+            "market": decision.market,
+            "status": decision.status.value,
+            "reasons": [reason.value for reason in decision.reasons],
+            "quote_volume": (None if decision.quote_volume is None else str(decision.quote_volume)),
+            "liquidity_rank": decision.liquidity_rank,
+        }
+        print(json.dumps(payload, separators=(",", ":")))
+
+    summary = {
+        "type": "summary",
+        "status": result.status.value,
+        "reasons": [reason.value for reason in result.reasons],
+        "policy_name": result.policy_name,
+        "policy_version": result.policy_version,
+        "liquidity_policy_name": result.liquidity_policy_name,
+        "liquidity_policy_version": result.liquidity_policy_version,
+        "catalog_policy_name": result.catalog_policy_name,
+        "catalog_policy_version": result.catalog_policy_version,
+        "top_n": result.top_n,
+        "quote_currency": result.quote_currency,
+        "window_start": _optional_utc_text(result.window_start),
+        "window_end": _optional_utc_text(result.window_end),
+        "as_of": _optional_utc_text(result.as_of),
+        "lookback_days": result.lookback.days,
+        "maximum_snapshot_age_seconds": _duration_seconds(result.maximum_snapshot_age),
+        "snapshot_id": result.snapshot_id,
+        "observed_at": (
+            None if result.observed_at is None else _optional_utc_text(result.observed_at)
+        ),
+        "available_at": (
+            None if result.available_at is None else _optional_utc_text(result.available_at)
+        ),
+        "content_hash": result.content_hash,
+        "catalog_candidate_count": result.catalog_candidate_count,
+        "catalog_excluded_count": result.catalog_excluded_count,
+        "liquidity_candidate_count": result.liquidity_candidate_count,
+        "liquidity_resolved_count": result.liquidity_resolved_count,
+        "liquidity_unresolved_count": result.liquidity_unresolved_count,
+        "selected_count": result.selected_count,
+        "excluded_count": result.excluded_count,
+        "unresolved_count": result.unresolved_count,
+    }
+    print(json.dumps(summary, separators=(",", ":")))
+    return 2 if result.status is LiquidityTopNEvaluationStatus.UNRESOLVED else 0
+
+
 async def _print_candles(market: str, count: int) -> None:
     candles = await fetch_recent_minute_candles(market, count)
 
@@ -934,6 +1043,19 @@ def main(argv: Sequence[str] | None = None) -> int | None:
             arguments.window_end,
             arguments.as_of,
             arguments.maximum_snapshot_age_seconds,
+            arguments.database,
+        )
+
+    if arguments.command == "liquidity-top-n":
+        if arguments.as_of < arguments.window_end:
+            parser.error("liquidity-top-n: --as-of must not be before --window-end")
+
+        return _print_liquidity_top_n(
+            arguments.quote_currency,
+            arguments.window_end,
+            arguments.as_of,
+            arguments.maximum_snapshot_age_seconds,
+            arguments.top_n,
             arguments.database,
         )
 

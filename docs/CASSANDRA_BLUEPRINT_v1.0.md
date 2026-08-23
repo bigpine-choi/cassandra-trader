@@ -75,7 +75,7 @@ v1 완료는 “가장 최신 모델을 넣었다”가 아니라 다음 상태�
 | 계좌 대사 | 시스템 기동·WebSocket 재접속·주문 종료 상태·정해진 주기에 REST 기준 상태와 내부 상태를 비교해 수행 |
 | 주 예측 수평선 | 7일 |
 | 목표 평균 보유기간 | 약 7일의 목표 회전율; 고정·최소·최대 보유기간이 아니며 조기 매도·장기 보유 모두 허용 |
-| 유니버스 | 시점별 최근 30일 거래대금 상위 약 30개 적격 KRW 종목 |
+| 유니버스 | catalog는 Upbit KRW 전체, analysis는 fresh non-warning 전체, execution candidate는 명시적 30일 유동성 top-N(초기 `top_n=100`) |
 | 알파 Champion | Elastic Net + LightGBM/LambdaRank |
 | 레짐 Champion | 해석 가능한 연속 점수; 총 노출 0~100% |
 | 종목 수 | 고정 K 없음; 엣지·비용·불확실성·유동성으로 결정 |
@@ -227,19 +227,18 @@ flowchart TD
 
 현재 구현은 complete market catalog snapshot과 point-in-time membership 조회 위에 versioned catalog eligibility gate를 분리해 둔다. snapshot 계층은 당시 membership과 warning metadata를 사실로 보존하며 eligibility 계층이 호출자가 명시한 maximum snapshot age와 warning만 판정한다. snapshot이 없거나 `as_of - observed_at`이 maximum age를 초과하면 전체를 `UNRESOLVED`로 fail-closed하고, fresh snapshot에서 warning market은 `EXCLUDED`, 나머지는 `ELIGIBLE`이다. 여기서 `ELIGIBLE`은 최종 매수 대상이 아니라 후속 유동성 심사 전 catalog-level 후보다.
 
-fresh catalog eligibility의 `ELIGIBLE` market에는 point-in-time trailing 30-day KRW quote-volume metric을 계산한다. 정확한 UTC 43,200분의 모든 slot이 `TRADED` 또는 `NO_TRADE`로 resolved된 후보만 volume을 제공하고, 후보 하나라도 unresolved이면 전체 rank를 생성하지 않는다. warning market은 upstream에서 제외된다. 이 rank는 유동성 metric의 결정론적 순서일 뿐 최종 top-N이나 매수 대상이 아니다.
+fresh catalog eligibility의 `ELIGIBLE` market에는 point-in-time trailing 30-day KRW quote-volume metric을 계산한다. 정확한 UTC 43,200분의 모든 slot이 `TRADED` 또는 `NO_TRADE`로 resolved된 후보만 volume을 제공하고, 후보 하나라도 unresolved이면 전체 rank를 생성하지 않는다. warning market은 upstream에서 제외된다.
 
-`/v1/market/all`의 현재 목록을 과거로 소급하지 않고 최초 성공 snapshot 이전은 `UNRESOLVED`로 둔다. current listing이나 candle history로 listing age를 합성하지 않으며, 상장 후 90일·최종 top-N과 공지사항 등 authoritative source에 근거한 과거 상장·폐지 이력 backfill은 아직 구현되지 않았다.
+versioned liquidity top-N policy는 완결된 upstream ordinal rank와 호출자가 명시한 N만 사용한다. rank가 N 이하면 `SELECTED`, 그 밖은 `OUTSIDE_TOP_N`으로 `EXCLUDED`하며 동률 종목을 N 밖에서 추가하지 않는다. upstream liquidity가 `UNRESOLVED`이면 일부 volume이 있더라도 모든 존재 후보를 `UNRESOLVED`로 두고 partial selection을 금지한다. 이 결과는 상장기간 심사 전 execution shortlist이며 최종 투자 유니버스나 매수 신호가 아니다.
 
-- Upbit KRW 마켓의 최근 30일 거래대금 상위 약 30종목
-- 상장 후 90일 미만 종목 제외
-- 거래 유의·정지 종목 제외
-- 스테이블코인 제외
-- 데이터가 불완전한 종목 제외
-- 잦은 교체를 막기 위한 진입·퇴출 버퍼 적용
-- BTC와 ETH는 거래대상 편입 여부와 무관하게 레짐 입력에 항상 포함
+`/v1/market/all`의 현재 목록을 과거로 소급하지 않고 최초 성공 snapshot 이전은 `UNRESOLVED`로 둔다. current listing이나 candle history로 listing age를 합성하지 않으며, 상장 후 90일 정책과 공지사항 등 authoritative source에 근거한 과거 상장·폐지 이력 backfill은 아직 구현되지 않았다.
 
-“약 30개”는 유동성 후보군의 목표 규모다. 적격 조건을 만족하는 수가 적으면 억지로 채우지 않는다.
+- catalog universe: Upbit KRW 전체 market을 snapshot과 데이터 수집 대상으로 삼고 warning market의 사실 데이터와 metadata도 보존한다.
+- analysis universe: fresh catalog의 non-warning market 전체다. 향후 feature, 시장 폭, 모멘텀, 변동성, 횡단면 분석은 liquidity top-N으로 축소하지 않고 이 전체 집합을 사용한다.
+- execution candidate universe: point-in-time 30일 유동성 rank의 명시적 top-N shortlist다. 초기 운영 목표는 `top_n=100`이며 domain·application 상수로 고정하지 않고 CLI와 실행 설정에서 전달한다.
+- portfolio: execution candidate 중 기존 정책에 따라 최대 6개 보유를 목표로 하지만 signal·portfolio·execution은 아직 구현되지 않았다.
+
+Top 100도 최종 매수 신호가 아니며 후보가 100개보다 적으면 억지로 채우지 않는다. 상장 후 90일 정책과 authoritative listing history가 구현되기 전에는 이 shortlist를 최종 투자 universe로 해석하지 않는다.
 
 ### 6.2 벤치마크
 
@@ -458,9 +457,11 @@ canonical 1분봉을 기본 시계열 데이터로 삼고, 결측·중복·무�
 
 마켓 유니버스 membership은 `available_at <= as_of`인 성공한 complete catalog snapshot 중 결정론적으로 가장 최근 관측을 사용한다. 더 최근 실패는 이전 성공 snapshot을 무효화하지 않는다. current listing이나 candle 최초·최종 시각으로 synthetic listing history를 만들지 않으며, 최초 성공 snapshot 이전은 `UNRESOLVED`다. snapshot 계층은 raw warning metadata를 보존하되 eligibility 결정을 내리지 않는다.
 
-catalog eligibility는 선택된 universe를 재사용하며 네트워크나 current catalog로 fallback하지 않는다. freshness는 `as_of - observed_at`이고 maximum age는 실행마다 명시한다. age가 maximum 이하인 fresh snapshot에서 warning market만 제외하며, snapshot 부재나 stale snapshot은 모두 fail-closed `UNRESOLVED`다. 이 결과는 영속화하지 않고 정책 이름·버전·maximum age와 snapshot metadata를 함께 반환한다. `ELIGIBLE`은 최근 30일 유동성·상장 후 90일·최종 top-N 심사를 통과했다는 뜻이 아니다.
+catalog eligibility는 선택된 universe를 재사용하며 네트워크나 current catalog로 fallback하지 않는다. freshness는 `as_of - observed_at`이고 maximum age는 실행마다 명시한다. age가 maximum 이하인 fresh snapshot에서 warning market만 제외하며, snapshot 부재나 stale snapshot은 모두 fail-closed `UNRESOLVED`다. 이 결과는 영속화하지 않고 정책 이름·버전·maximum age와 snapshot metadata를 함께 반환한다. `ELIGIBLE`은 최근 30일 유동성·liquidity top-N shortlist·상장 후 90일 심사를 통과했다는 뜻이 아니다.
 
 trailing liquidity는 catalog-level `ELIGIBLE` market에만 정확한 UTC `[window_end - 30 days, window_end)`를 적용한다. canonical과 successful backfill evidence를 `as_of` 기준으로 결합해 43,200개 slot이 모두 resolved된 market만 실제 `TRADED` candle의 KRW `quote_volume`을 합산한다. `NO_TRADE` candle을 합성하거나 forward-fill하지 않으며, unresolved slot이 있는 partial volume은 rank에 사용하지 않는다. 모든 후보가 resolved일 때만 volume 내림차순·market code 오름차순 tie-break로 ordinal rank를 만들고, 결과 tuple 자체는 market code 순서를 유지한다.
+
+liquidity top-N은 이 point-in-time rank를 다시 계산하지 않고 그대로 재사용하는 read-only policy다. 결과와 JSONL은 market code 순서를 유지하고 정책·catalog·snapshot·window metadata를 보존한다. upstream 전체가 resolved일 때만 N 이내를 선별하며, unresolved upstream에는 selection이나 partial rank를 만들지 않는다. 초기 execution shortlist 설정은 명시적 `top_n=100`이고 코드에 하드코딩하지 않는다. 이 shortlist는 analysis universe를 제한하지 않으며 synthetic candle, forward-fill, 결과 영속화를 수행하지 않고 아직 signal·portfolio·execution에 연결하지 않는다.
 
 연구 데이터는 Parquet + DuckDB를 기본 제안으로 하고, 운영 주문·상태 원장은 PostgreSQL을 기본 제안으로 한다. Redis나 Kafka는 필요성이 입증되기 전에는 도입하지 않는다.
 
@@ -767,13 +768,14 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | 마켓 유니버스 | 저장된 성공 snapshot만으로 `AVAILABLE`·`UNRESOLVED`를 판정하고 market code 순서 membership과 관측·가용 시각·content hash 제공 |
 | catalog eligibility | 선택된 point-in-time universe에 명시적 freshness 한계와 warning 정책을 적용해 `ELIGIBLE`·`EXCLUDED`·`UNRESOLVED` 판정, stale·snapshot 부재 시 fail-closed |
 | 유동성 평가 | fresh non-warning 후보의 trailing 30-day KRW quote volume을 minute evidence로 요약하고 전체 후보 완결 시 결정론적 rank 제공 |
+| liquidity top-N | 완결된 point-in-time liquidity rank에서 명시적 N 이내만 선별하고 upstream unresolved 시 모든 selection을 fail-closed |
 | 데이터셋 백필 | 명시한 KRW 마켓을 정규화·중복 제거·사전순 정렬하고, 하나의 client·repository로 순차 처리하며 종목 실패를 격리하는 서비스 |
 | coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
 | 파생 봉 | point-in-time minute slot 240개를 resolve해 `COMPLETE`·`NO_TRADE`·`INCOMPLETE`를 구분하고, `COMPLETE`에는 실제 `TRADED` 분봉만 집계 |
 | 실시간 reconciliation | 기동 lookback과 각 완결 분에 REST를 다시 조회해 WebSocket 관측을 canonical 저장소와 대사하고 신규·수정·동일 revision을 구분 |
-| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity 평가, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
+| CLI | live 마켓·최근 봉 조회, catalog capture/as-of query, read-only eligibility·30일 liquidity·top-N 평가, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
 | 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |
-| 미구현 | authoritative 과거 상장·폐지 이력 backfill, 자동 30일 데이터 backfill, 상장 후 90일·최종 top-N eligibility, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
+| 미구현 | authoritative 과거 상장·폐지 이력 backfill, 자동 30일 데이터 backfill, 상장 후 90일을 결합한 최종 투자 universe, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
 
 현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical, bounded backfill evidence와 market catalog snapshot만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. coverage의 `absent_slots` 자체는 중립적 관측 부재이고, 성공한 범위 증거와 결합된 resolver만 `NO_TRADE`를 판정한다.
 
@@ -813,9 +815,10 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 8. 완료: append-only complete market catalog snapshot과 point-in-time membership 조회
 9. 완료: snapshot freshness와 warning 기반의 versioned catalog eligibility gate
 10. 완료: 전체 후보 완결성을 요구하는 trailing 30-day KRW quote-volume metric과 rank
-11. 이후 로드맵: top-N·상장 이력 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
+11. 완료: 완결된 point-in-time liquidity rank를 재사용하는 versioned top-N shortlist
+12. 이후 로드맵: authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
 
-이 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 point-in-time top-N·상장 이력 심사와 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
+이 top-N은 상장 이력 심사 전 liquidity shortlist다. 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 authoritative listing history와 상장 후 90일 심사, 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
 
 ---
 
