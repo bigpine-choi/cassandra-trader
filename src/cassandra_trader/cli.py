@@ -21,6 +21,11 @@ from cassandra_trader.apps.minute_candles import (
     sync_recent_minute_candles,
 )
 from cassandra_trader.apps.minute_reconciliation import MinuteReconciliationResult
+from cassandra_trader.apps.multi_market_dataset import (
+    backfill_multi_market_dataset,
+    market_result_payload,
+    summary_payload,
+)
 from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
@@ -57,8 +62,23 @@ def _market_code(value: str) -> str:
     normalized = value.strip().upper()
     quote, separator, base = normalized.partition("-")
 
-    if not separator or not quote.isalnum() or not base.isalnum():
+    if (
+        not separator
+        or not quote.isascii()
+        or not quote.isalnum()
+        or not base.isascii()
+        or not base.isalnum()
+    ):
         raise argparse.ArgumentTypeError("market must look like KRW-BTC")
+
+    return normalized
+
+
+def _krw_market_code(value: str) -> str:
+    normalized = _market_code(value)
+
+    if not normalized.startswith("KRW-"):
+        raise argparse.ArgumentTypeError("market must be an Upbit KRW market")
 
     return normalized
 
@@ -171,6 +191,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="exclusive UTC minute boundary in ISO 8601 format",
     )
     backfill_candles.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    backfill_dataset = commands.add_parser(
+        "backfill-dataset",
+        help="sequentially backfill one UTC range for Upbit KRW markets",
+    )
+    backfill_dataset.add_argument(
+        "markets",
+        type=_krw_market_code,
+        nargs="+",
+        help="one or more explicit Upbit KRW market codes",
+    )
+    backfill_dataset.add_argument(
+        "--start",
+        type=_minute_boundary,
+        required=True,
+        help="inclusive UTC minute boundary in ISO 8601 format",
+    )
+    backfill_dataset.add_argument(
+        "--end",
+        type=_minute_boundary,
+        required=True,
+        help="exclusive UTC minute boundary in ISO 8601 format",
+    )
+    backfill_dataset.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -308,6 +357,21 @@ async def _backfill_candles(
     print(f"latest_candle_time={_optional_utc_text(result.latest_candle_time)}")
     print(f"requested_start={_optional_utc_text(result.requested_start)}")
     print(f"requested_end={_optional_utc_text(result.requested_end)}")
+
+
+async def _backfill_dataset(
+    markets: list[str],
+    start: datetime,
+    end: datetime,
+    database: Path,
+) -> int:
+    result = await backfill_multi_market_dataset(markets, start, end, database)
+
+    for market_result in result.markets:
+        print(json.dumps(market_result_payload(market_result), separators=(",", ":")))
+
+    print(json.dumps(summary_payload(result.summary), separators=(",", ":")))
+    return 1 if result.summary.failed else 0
 
 
 def _optional_utc_text(value: datetime | None) -> str:
@@ -508,6 +572,19 @@ def main(argv: Sequence[str] | None = None) -> int | None:
             )
         )
         return 0
+
+    if arguments.command == "backfill-dataset":
+        if arguments.start >= arguments.end:
+            parser.error("backfill-dataset: --start must be before --end")
+
+        return asyncio.run(
+            _backfill_dataset(
+                arguments.markets,
+                arguments.start,
+                arguments.end,
+                arguments.database,
+            )
+        )
 
     if arguments.command == "four-hour-bar":
         return _print_four_hour_bar(

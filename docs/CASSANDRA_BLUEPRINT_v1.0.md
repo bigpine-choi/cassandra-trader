@@ -735,19 +735,26 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 
 ## 18. 현재 구현 상태와 목표 아키텍처의 경계
 
-현재 저장소는 Python 3.12와 `uv`를 사용하는 초기 읽기 전용 단계다. 구현된 범위는 다음과 같다.
+현재 저장소는 Python 3.12와 `uv`를 사용하는 공개 시장 데이터 읽기 전용 단계다. PR #9까지의 실시간 reconciliation 경로와 그 이후 복수 마켓 데이터셋 백필을 포함한 구현 범위는 다음과 같다.
 
 | 영역 | 현재 구현 상태 |
 |---|---|
 | 프로젝트 기반 | `pyproject.toml`, lockfile, Python 3.12 패키지와 CLI 진입점 |
-| Upbit 연동 | 공식 Upbit SDK를 사용한 인증 없는 KRW 마켓 카탈로그 조회 |
-| 도메인 경계 | Upbit SDK 응답을 내부 `TradingPair` 도메인 모델로 변환 |
-| 검증 | CLI, 단위 테스트 4개, GitHub Actions의 Ruff format·lint·pytest 기본 품질 검사 |
-| 미구현 | REST·WebSocket 1분봉 수집, canonical 1분봉과 완결 4시간봉 생성, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 실제 주문, 주문·잔고 대사, 원장, 백테스트, paper/shadow/live 실행 |
+| Upbit REST | 공식 Upbit SDK를 사용한 인증 없는 KRW 마켓 카탈로그, 최근 완결 1분봉, 페이지 기반 `[start, end)` 과거 1분봉 조회 |
+| Upbit WebSocket | 공개 ticker·1분봉 정규화, 중복 제거, ping/pong, 지수 backoff와 jitter를 적용한 재연결·재구독 |
+| 저장 | SQLite append-only raw batch·record와 immutable canonical 1분봉 revision, 원자적 적재와 batch replay 멱등성 |
+| point-in-time 조회 | `[start, end)`와 `as_of` 기준으로 분당 최신 가용 revision을 선택하는 canonical slice 및 logical coverage |
+| 데이터셋 백필 | 명시한 KRW 마켓을 정규화·중복 제거·사전순 정렬하고, 하나의 client·repository로 순차 처리하며 종목 실패를 격리하는 서비스 |
+| coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
+| 파생 봉 | 완결 canonical 1분봉 240개가 정확히 존재할 때 UTC 4시간봉을 결정론적으로 생성하고, 누락 시 구조화된 incomplete 결과 반환 |
+| 실시간 reconciliation | 기동 lookback과 각 완결 분에 REST를 다시 조회해 WebSocket 관측을 canonical 저장소와 대사하고 신규·수정·동일 revision을 구분 |
+| CLI | 마켓·최근 봉 조회, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
+| 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |
+| 미구현 | point-in-time 유니버스, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
 
-현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다.
+현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical 테이블만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. 복수 마켓 백필의 `absent_slots`는 아직 `NO_TRADE`나 데이터 장애로 분류하지 않는 중립적 관측 부재다.
 
-이 문서의 데이터 저장, WebSocket, point-in-time 유니버스, 모델, 포트폴리오, 위험, 주문, 대사, 운영 인프라 설계는 현재 구현 설명이 아니라 v1 목표 아키텍처다. 이후 구현은 각 로드맵 단계와 배포 게이트를 통과하면서 이 기준선에 수렴시킨다.
+이 문서의 point-in-time 유니버스, 모델, 포트폴리오, 위험, 주문, 계좌 대사와 운영 인프라 설계는 현재 구현 설명이 아니라 v1 목표 아키텍처다. 이후 구현은 각 로드맵 단계와 배포 게이트를 통과하면서 이 기준선에 수렴시킨다.
 
 ---
 
@@ -771,16 +778,16 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 
 ## 20. 바로 다음 행동
 
-다음 핵심 마일스톤은 **canonical 1분봉 기반 시장 데이터 경로**다. 4시간봉만 직접 수집하는 별도 경로가 아니라 다음 순서를 하나의 재현 가능한 파이프라인으로 구현한다.
+canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다음과 같다. 4시간봉만 직접 수집하는 별도 경로가 아니라 하나의 재현 가능한 파이프라인으로 확장한다.
 
-1. 인증이 필요 없는 REST 1분봉 과거 데이터 수집
-2. 원응답과 수신 메타데이터를 보존하는 append-only raw 저장
-3. 버전이 있는 canonical 1분봉 정규화
-4. 결측·중복·무거래 구간의 구분과 품질 상태 기록
-5. 완결된 canonical 1분봉으로부터 UTC 경계의 완결 4시간봉 생성
-6. WebSocket ticker·1분봉 실시간 수집과 동일 canonical 경로 적용
-7. 연결 단절 시 REST 1분봉 backfill, 중복 제거, 재연결 전후 재현성 검증
-8. 이후 실시간 위험 감시와 보유 종목·상위 후보·주문 대상 중심의 체결·호가 수집
+1. 완료: 인증이 필요 없는 REST 1분봉 과거 데이터 수집
+2. 완료: 원응답과 수신 메타데이터를 보존하는 append-only raw 저장
+3. 완료: 버전이 있는 canonical 1분봉 정규화와 `as_of` 조회
+4. 완료: 완결된 canonical 1분봉으로부터 UTC 경계의 완결 4시간봉 생성
+5. 완료: WebSocket ticker·1분봉 실시간 수집, 재연결과 REST reconciliation
+6. 완료: 명시적 복수 KRW 마켓 `[start, end)` 순차 백필과 canonical coverage 보고
+7. 현재 경계: `absent_slots`는 중립적으로만 기록하고 분봉을 합성하거나 원인을 확정하지 않음
+8. 이후 로드맵: point-in-time 유니버스와 백테스트에 필요한 재현 가능한 데이터셋 확장
 
 이 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 point-in-time 유니버스와 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
 
