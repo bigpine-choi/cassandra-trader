@@ -45,6 +45,13 @@ from cassandra_trader.domain.market_eligibility import (
     MarketEligibilityResult,
     evaluate_market_eligibility,
 )
+from cassandra_trader.domain.market_liquidity import (
+    MARKET_LIQUIDITY_POLICY_NAME,
+    MARKET_LIQUIDITY_POLICY_VERSION,
+    MarketLiquidityResult,
+    evaluate_market_liquidity,
+)
+from cassandra_trader.domain.minute_slot import MinuteSlotSummary
 from cassandra_trader.domain.public_stream import StreamType, TickerEvent
 
 
@@ -571,6 +578,381 @@ def test_eligible_markets_rejects_invalid_arguments_before_query(
 
     assert called is False
     assert not (tmp_path / "catalog.db").exists()
+
+
+def test_market_liquidity_outputs_market_order_metrics_then_resolved_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    window_end = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    window_start = window_end - timedelta(days=30)
+    as_of = window_end + timedelta(minutes=10)
+    maximum_age = timedelta(hours=1)
+    database = tmp_path / "liquidity.db"
+    universe = MarketUniverseResult(
+        status=MarketUniverseStatus.AVAILABLE,
+        quote_currency="KRW",
+        as_of=as_of,
+        snapshot_id="snapshot-1",
+        observed_at=as_of - timedelta(minutes=5),
+        available_at=as_of - timedelta(minutes=4),
+        content_hash="e" * 64,
+        pairs=(
+            TradingPair("KRW-ADA", "에이다", "Cardano", True),
+            TradingPair("KRW-BTC", "비트코인", "Bitcoin", False),
+            TradingPair("KRW-ETH", "이더리움", "Ethereum", False),
+        ),
+    )
+    eligibility = evaluate_market_eligibility(universe, maximum_age)
+    result = evaluate_market_liquidity(
+        eligibility,
+        window_end,
+        (
+            MinuteSlotSummary(
+                market="KRW-BTC",
+                start_time_utc=window_start,
+                end_time_utc=window_end,
+                as_of=as_of,
+                expected_count=43_200,
+                traded_count=1,
+                no_trade_count=43_199,
+                unresolved_count=0,
+                quote_volume=Decimal("20.000000001"),
+            ),
+            MinuteSlotSummary(
+                market="KRW-ETH",
+                start_time_utc=window_start,
+                end_time_utc=window_end,
+                as_of=as_of,
+                expected_count=43_200,
+                traded_count=0,
+                no_trade_count=43_200,
+                unresolved_count=0,
+                quote_volume=Decimal(0),
+            ),
+        ),
+    )
+
+    def fake_evaluate(
+        quote_currency: str,
+        requested_window_end: datetime,
+        cutoff: datetime,
+        database_path: str | Path,
+        maximum_snapshot_age: timedelta,
+    ) -> MarketLiquidityResult:
+        assert quote_currency == "KRW"
+        assert requested_window_end == window_end
+        assert cutoff == as_of
+        assert database_path == database
+        assert maximum_snapshot_age == maximum_age
+        return result
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_liquidity_as_of",
+        fake_evaluate,
+    )
+
+    exit_code = main(
+        [
+            "market-liquidity",
+            "--quote-currency",
+            "KRW",
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+            "--database",
+            str(database),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 0
+    assert lines == [
+        {
+            "type": "market",
+            "market": "KRW-BTC",
+            "status": "RESOLVED",
+            "reasons": [],
+            "expected_count": 43_200,
+            "traded_count": 1,
+            "no_trade_count": 43_199,
+            "unresolved_count": 0,
+            "quote_volume": "20.000000001",
+            "rank": 1,
+        },
+        {
+            "type": "market",
+            "market": "KRW-ETH",
+            "status": "RESOLVED",
+            "reasons": [],
+            "expected_count": 43_200,
+            "traded_count": 0,
+            "no_trade_count": 43_200,
+            "unresolved_count": 0,
+            "quote_volume": "0",
+            "rank": 2,
+        },
+        {
+            "type": "summary",
+            "status": "RESOLVED",
+            "reasons": [],
+            "policy_name": MARKET_LIQUIDITY_POLICY_NAME,
+            "policy_version": MARKET_LIQUIDITY_POLICY_VERSION,
+            "catalog_policy_name": MARKET_ELIGIBILITY_POLICY_NAME,
+            "catalog_policy_version": MARKET_ELIGIBILITY_POLICY_VERSION,
+            "quote_currency": "KRW",
+            "window_start": "2026-07-24T12:00:00Z",
+            "window_end": "2026-08-23T12:00:00Z",
+            "as_of": "2026-08-23T12:10:00Z",
+            "lookback_days": 30,
+            "maximum_snapshot_age_seconds": 3600,
+            "snapshot_id": "snapshot-1",
+            "observed_at": "2026-08-23T12:05:00Z",
+            "available_at": "2026-08-23T12:06:00Z",
+            "content_hash": "e" * 64,
+            "catalog_candidate_count": 3,
+            "catalog_excluded_count": 1,
+            "liquidity_candidate_count": 2,
+            "liquidity_resolved_count": 2,
+            "liquidity_unresolved_count": 0,
+        },
+    ]
+
+
+def test_market_liquidity_unresolved_catalog_outputs_summary_only_and_exit_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    window_end = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    as_of = window_end + timedelta(minutes=10)
+    maximum_age = timedelta(hours=1)
+    universe = MarketUniverseResult(
+        status=MarketUniverseStatus.UNRESOLVED,
+        quote_currency="KRW",
+        as_of=as_of,
+        snapshot_id=None,
+        observed_at=None,
+        available_at=None,
+        content_hash=None,
+        pairs=(),
+    )
+    result = evaluate_market_liquidity(
+        evaluate_market_eligibility(universe, maximum_age),
+        window_end,
+        (),
+    )
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_liquidity_as_of",
+        lambda *args, **kwargs: result,
+    )
+
+    exit_code = main(
+        [
+            "market-liquidity",
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+            "--database",
+            str(tmp_path / "liquidity.db"),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 2
+    assert len(lines) == 1
+    assert lines[0]["type"] == "summary"
+    assert lines[0]["status"] == "UNRESOLVED"
+    assert lines[0]["reasons"] == ["CATALOG_ELIGIBILITY_UNRESOLVED"]
+    assert lines[0]["snapshot_id"] is None
+    assert lines[0]["liquidity_candidate_count"] == 0
+
+
+def test_market_liquidity_unresolved_data_suppresses_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    window_end = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    window_start = window_end - timedelta(days=30)
+    as_of = window_end + timedelta(minutes=10)
+    maximum_age = timedelta(hours=1)
+    universe = MarketUniverseResult(
+        status=MarketUniverseStatus.AVAILABLE,
+        quote_currency="KRW",
+        as_of=as_of,
+        snapshot_id="snapshot-partial",
+        observed_at=as_of - timedelta(minutes=5),
+        available_at=as_of - timedelta(minutes=4),
+        content_hash="d" * 64,
+        pairs=(
+            TradingPair("KRW-BTC", "비트코인", "Bitcoin", False),
+            TradingPair("KRW-ETH", "이더리움", "Ethereum", False),
+        ),
+    )
+    result = evaluate_market_liquidity(
+        evaluate_market_eligibility(universe, maximum_age),
+        window_end,
+        (
+            MinuteSlotSummary(
+                market="KRW-BTC",
+                start_time_utc=window_start,
+                end_time_utc=window_end,
+                as_of=as_of,
+                expected_count=43_200,
+                traded_count=1,
+                no_trade_count=43_199,
+                unresolved_count=0,
+                quote_volume=Decimal("1.000000001"),
+            ),
+            MinuteSlotSummary(
+                market="KRW-ETH",
+                start_time_utc=window_start,
+                end_time_utc=window_end,
+                as_of=as_of,
+                expected_count=43_200,
+                traded_count=0,
+                no_trade_count=43_199,
+                unresolved_count=1,
+                quote_volume=Decimal(0),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_liquidity_as_of",
+        lambda *args, **kwargs: result,
+    )
+
+    exit_code = main(
+        [
+            "market-liquidity",
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+            "--database",
+            str(tmp_path / "liquidity.db"),
+        ]
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert exit_code == 2
+    assert [line["type"] for line in lines] == ["market", "market", "summary"]
+    assert [line["market"] for line in lines[:-1]] == ["KRW-BTC", "KRW-ETH"]
+    assert [line["rank"] for line in lines[:-1]] == [None, None]
+    assert [line["quote_volume"] for line in lines[:-1]] == ["1.000000001", None]
+    assert lines[-1]["status"] == "UNRESOLVED"
+    assert lines[-1]["reasons"] == ["LIQUIDITY_DATA_UNRESOLVED"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "--quote-currency",
+            "USDT",
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T12:00:00.000001Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T21:00:00+09:00",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+        ],
+        [
+            "--window-end",
+            "0001-01-01T00:00:00Z",
+            "--as-of",
+            "0001-01-01T00:00:00Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T11:59:59.999999Z",
+            "--maximum-snapshot-age-seconds",
+            "3600",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "0",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "-1",
+        ],
+        [
+            "--window-end",
+            "2026-08-23T12:00:00Z",
+            "--as-of",
+            "2026-08-23T12:10:00Z",
+            "--maximum-snapshot-age-seconds",
+            "86400000000000",
+        ],
+    ],
+)
+def test_market_liquidity_rejects_invalid_arguments_before_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    def unexpected_query(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.evaluate_market_liquidity_as_of",
+        unexpected_query,
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "market-liquidity",
+                *arguments,
+                "--database",
+                str(tmp_path / "liquidity.db"),
+            ]
+        )
+
+    assert called is False
+    assert not (tmp_path / "liquidity.db").exists()
 
 
 def test_candles_command(

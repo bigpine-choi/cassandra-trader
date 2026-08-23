@@ -16,6 +16,7 @@ from cassandra_trader.apps.market_data_runtime import (
     run_market_data,
 )
 from cassandra_trader.apps.market_eligibility import evaluate_market_eligibility_as_of
+from cassandra_trader.apps.market_liquidity import evaluate_market_liquidity_as_of
 from cassandra_trader.apps.market_universe import (
     capture_krw_market_catalog,
     resolve_market_universe_as_of,
@@ -35,6 +36,7 @@ from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 from cassandra_trader.domain.market import MarketUniverseStatus, normalize_quote_currency
 from cassandra_trader.domain.market_eligibility import MarketEligibilityEvaluationStatus
+from cassandra_trader.domain.market_liquidity import MarketLiquidityEvaluationStatus
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
 
 
@@ -108,6 +110,15 @@ def _quote_currency(value: str) -> str:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def _krw_quote_currency(value: str) -> str:
+    normalized = _quote_currency(value)
+
+    if normalized != "KRW":
+        raise argparse.ArgumentTypeError("quote currency must be KRW")
+
+    return normalized
+
+
 def _utc_datetime(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -137,6 +148,17 @@ def _minute_boundary(value: str) -> datetime:
 
     if parsed.second != 0 or parsed.microsecond != 0:
         raise argparse.ArgumentTypeError("timestamp must align to a one-minute UTC boundary")
+
+    return parsed
+
+
+def _liquidity_window_end(value: str) -> datetime:
+    parsed = _minute_boundary(value)
+
+    try:
+        parsed - timedelta(days=30)
+    except OverflowError as error:
+        raise argparse.ArgumentTypeError("window-end must support a 30-day lookback") from error
 
     return parsed
 
@@ -213,6 +235,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="positive maximum catalog snapshot age in seconds",
     )
     eligible_markets.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    market_liquidity = commands.add_parser(
+        "market-liquidity",
+        help="rank complete trailing 30-day KRW quote volume without network access",
+    )
+    market_liquidity.add_argument(
+        "--quote-currency",
+        type=_krw_quote_currency,
+        default="KRW",
+        help="quote currency (must be KRW)",
+    )
+    market_liquidity.add_argument(
+        "--window-end",
+        type=_liquidity_window_end,
+        required=True,
+        help="exclusive UTC minute boundary for the 30-day window",
+    )
+    market_liquidity.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC information cutoff in ISO 8601 format",
+    )
+    market_liquidity.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    market_liquidity.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -521,6 +578,68 @@ def _print_eligible_markets(
     return 2 if result.status is MarketEligibilityEvaluationStatus.UNRESOLVED else 0
 
 
+def _print_market_liquidity(
+    quote_currency: str,
+    window_end: datetime,
+    as_of: datetime,
+    maximum_snapshot_age_seconds: int,
+    database: Path,
+) -> int:
+    result = evaluate_market_liquidity_as_of(
+        quote_currency,
+        window_end,
+        as_of,
+        database,
+        timedelta(seconds=maximum_snapshot_age_seconds),
+    )
+
+    for metric in result.metrics:
+        payload = {
+            "type": "market",
+            "market": metric.market,
+            "status": metric.status.value,
+            "reasons": [reason.value for reason in metric.reasons],
+            "expected_count": metric.expected_count,
+            "traded_count": metric.traded_count,
+            "no_trade_count": metric.no_trade_count,
+            "unresolved_count": metric.unresolved_count,
+            "quote_volume": None if metric.quote_volume is None else str(metric.quote_volume),
+            "rank": metric.rank,
+        }
+        print(json.dumps(payload, separators=(",", ":")))
+
+    summary = {
+        "type": "summary",
+        "status": result.status.value,
+        "reasons": [reason.value for reason in result.reasons],
+        "policy_name": result.policy_name,
+        "policy_version": result.policy_version,
+        "catalog_policy_name": result.catalog_policy_name,
+        "catalog_policy_version": result.catalog_policy_version,
+        "quote_currency": result.quote_currency,
+        "window_start": _optional_utc_text(result.window_start),
+        "window_end": _optional_utc_text(result.window_end),
+        "as_of": _optional_utc_text(result.as_of),
+        "lookback_days": result.lookback.days,
+        "maximum_snapshot_age_seconds": _duration_seconds(result.maximum_snapshot_age),
+        "snapshot_id": result.snapshot_id,
+        "observed_at": (
+            None if result.observed_at is None else _optional_utc_text(result.observed_at)
+        ),
+        "available_at": (
+            None if result.available_at is None else _optional_utc_text(result.available_at)
+        ),
+        "content_hash": result.content_hash,
+        "catalog_candidate_count": result.catalog_candidate_count,
+        "catalog_excluded_count": result.catalog_excluded_count,
+        "liquidity_candidate_count": result.candidate_count,
+        "liquidity_resolved_count": result.resolved_market_count,
+        "liquidity_unresolved_count": result.unresolved_market_count,
+    }
+    print(json.dumps(summary, separators=(",", ":")))
+    return 2 if result.status is MarketLiquidityEvaluationStatus.UNRESOLVED else 0
+
+
 async def _print_candles(market: str, count: int) -> None:
     candles = await fetch_recent_minute_candles(market, count)
 
@@ -801,6 +920,18 @@ def main(argv: Sequence[str] | None = None) -> int | None:
     if arguments.command == "eligible-markets":
         return _print_eligible_markets(
             arguments.quote_currency,
+            arguments.as_of,
+            arguments.maximum_snapshot_age_seconds,
+            arguments.database,
+        )
+
+    if arguments.command == "market-liquidity":
+        if arguments.as_of < arguments.window_end:
+            parser.error("market-liquidity: --as-of must not be before --window-end")
+
+        return _print_market_liquidity(
+            arguments.quote_currency,
+            arguments.window_end,
             arguments.as_of,
             arguments.maximum_snapshot_age_seconds,
             arguments.database,
