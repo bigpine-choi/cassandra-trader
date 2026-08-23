@@ -155,7 +155,7 @@ flowchart TD
 | Market Data Collector | ticker·1분봉 상시 수신, 선별 체결·호가 구독, 재접속, gap·중복 탐지 |
 | Account Stream | 주문·체결·잔고 실시간 수신 및 상태 갱신 |
 | Canonicalizer | REST/WebSocket raw를 canonical ticker·1분봉·체결·호가로 정규화 |
-| Bar Builder | 완결된 canonical 1분봉으로 재현 가능한 완결 4시간봉 생성 |
+| Bar Builder | point-in-time minute slot에서 실제 거래 분봉만 집계해 재현 가능한 4시간봉 상태 생성 |
 | Universe Builder | point-in-time 적격 종목 선정과 편입·퇴출 이력 |
 | Feature Engine | 알파·레짐·위험·유동성 특징 산출 |
 | Alpha Engine | 종목별 순위, 비용 차감 기대 엣지, 확신도·불확실성 |
@@ -436,14 +436,16 @@ stateDiagram-v2
 | Raw | REST/WebSocket 원응답, 수신시각, 요청·연결 메타데이터 | append-only, 재처리 가능 |
 | Backfill Evidence | bounded REST 조회 범위, 관측·가용 시각, 성공·실패 결과 | append-only, point-in-time 판정 근거 |
 | Canonical | 실시간 ticker, canonical 1분봉, 선별 trade·orderbook, market status | 스키마 버전·품질 플래그 |
-| Derived Bar | 완결 canonical 1분봉에서 집계한 완결 4시간봉 | UTC 경계, 구성 1분봉과 품질 계보 |
+| Derived Bar | point-in-time minute slot에서 실제 거래 분봉만 집계한 4시간봉 | UTC 경계, slot 상태·구성 1분봉과 품질 계보 |
 | Feature | point-in-time 알파·레짐·위험 특징 | `as_of`, 코드·데이터 버전 |
 | Decision | 예측, 노출, 목표 비중, 위험 지시 | 완전한 판단 근거와 hash |
 | Execution | 주문 의도, 거래소 주문, 체결, 수수료, 대사 결과 | 감사 가능한 영속 원장 |
 
-canonical 1분봉을 기본 시계열 데이터로 삼고, 결측·중복·무거래 구간을 구분해 품질 상태와 처리 결과를 기록한다. 완결 4시간봉은 완결된 canonical 1분봉을 UTC 경계에 맞춰 집계한 의사결정용 파생 데이터다. 4시간은 수집 주기가 아니라 정상 알파·레짐·포트폴리오 의사결정 주기이며, 거래소의 REST 240분봉만 직접 받아 유일한 원천으로 저장하지 않는다.
+canonical 1분봉을 기본 시계열 데이터로 삼고, 결측·중복·무거래 구간을 구분해 품질 상태와 처리 결과를 기록한다. 4시간 결과는 UTC 경계의 정확히 240개 point-in-time minute slot에서 파생한다. 4시간은 수집 주기가 아니라 정상 알파·레짐·포트폴리오 의사결정 주기이며, 거래소의 REST 240분봉만 직접 받아 유일한 원천으로 저장하지 않는다.
 
 1분 slot은 `as_of`까지 이용 가능한 증거를 다음 순서로 판정한다. canonical candle이 있으면 `TRADED`, candle은 없지만 slot 전체를 덮고 slot 종료 뒤 관측된 성공한 bounded backfill 증거가 있으면 `NO_TRADE`, 그 밖에는 `UNRESOLVED`다. 실패한 backfill은 이전 성공 증거를 무효화하지 않으며 그 자체로 `NO_TRADE`를 만들지 않는다. 세 상태 판정은 synthetic candle이나 forward-fill을 생성하지 않는다.
+
+4시간 결과는 하나라도 `UNRESOLVED`이면 부분 candle 없이 `INCOMPLETE`, 240개 모두 `NO_TRADE`이면 데이터 부족이 아닌 관측 완료 상태 `NO_TRADE`다. 모든 slot이 resolved이고 `TRADED`가 하나 이상이면 `COMPLETE`이며 실제 `TRADED` candle만 OHLCV에 집계한다. `NO_TRADE` slot을 zero-volume candle로 합성하거나 가격을 forward-fill하지 않는다.
 
 연구 데이터는 Parquet + DuckDB를 기본 제안으로 하고, 운영 주문·상태 원장은 PostgreSQL을 기본 제안으로 한다. Redis나 Kafka는 필요성이 입증되기 전에는 도입하지 않는다.
 
@@ -666,7 +668,7 @@ class Reconciler(Protocol):
 |---|---|
 | 단위·속성 | NAV, 입출금 조정 수익률, C′ 내부 상대비중 합계 1, 최종 위험자산 목표 합계≤위험예산, 노출 0~1, 종목당 NAV 20% 절대 상한, 반올림, 봉 마감 |
 | 데이터 계약 | REST/WebSocket 스키마 변화, timestamp, 1분봉 gap·중복·무거래·역전, 재연결·REST backfill |
-| 시계열 | canonical 1분봉→완결 4시간봉 결정론, purging/embargo, point-in-time 특징, label overlap, 재학습 시점 |
+| 시계열 | point-in-time minute slot→4시간봉 상태·실거래 OHLCV 결정론, purging/embargo, point-in-time 특징, label overlap, 재학습 시점 |
 | 백테스트 회귀 | 동일 버전의 결과 재현, 비용 전후, 2배 비용, 다중 벤치마크 |
 | 주문 통합 | 부분 체결, 미체결, 취소 경합, timeout, 429/418, 순서 역전 |
 | 장애 주입 | WebSocket 단절·재연결, REST 복구·계좌 대사, 프로세스 강제 종료, DB 지연, stale quote, 원장 불일치 |
@@ -749,7 +751,7 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | point-in-time 조회 | `[start, end)`와 `as_of` 기준 최신 canonical revision과 성공한 범위 증거를 결합한 `TRADED`·`NO_TRADE`·`UNRESOLVED` slot |
 | 데이터셋 백필 | 명시한 KRW 마켓을 정규화·중복 제거·사전순 정렬하고, 하나의 client·repository로 순차 처리하며 종목 실패를 격리하는 서비스 |
 | coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
-| 파생 봉 | 완결 canonical 1분봉 240개가 정확히 존재할 때 UTC 4시간봉을 결정론적으로 생성하고, 누락 시 구조화된 incomplete 결과 반환 |
+| 파생 봉 | point-in-time minute slot 240개를 resolve해 `COMPLETE`·`NO_TRADE`·`INCOMPLETE`를 구분하고, `COMPLETE`에는 실제 `TRADED` 분봉만 집계 |
 | 실시간 reconciliation | 기동 lookback과 각 완결 분에 REST를 다시 조회해 WebSocket 관측을 canonical 저장소와 대사하고 신규·수정·동일 revision을 구분 |
 | CLI | 마켓·최근 봉 조회, 단일 batch 저장, 단일/복수 마켓 백필, 4시간봉 파생, 공개 stream, 단일 마켓 데이터 runtime |
 | 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |

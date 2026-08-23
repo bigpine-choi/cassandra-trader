@@ -471,8 +471,11 @@ def test_four_hour_bar_complete_output(
             start_time_utc=start,
             end_time_utc=end,
             expected_count=240,
-            actual_count=240,
-            missing_minute_starts=(),
+            resolved_count=240,
+            traded_count=239,
+            no_trade_count=1,
+            unresolved_count=0,
+            unresolved_minute_starts=(),
             candle=candle,
             reason=None,
         )
@@ -509,6 +512,66 @@ def test_four_hour_bar_complete_output(
         "close=110\n"
         "base_volume=24.5\n"
         "quote_volume=2500.75\n"
+        "expected_count=240\n"
+        "resolved_count=240\n"
+        "traded_count=239\n"
+        "no_trade_count=1\n"
+        "unresolved_count=0\n"
+    )
+
+
+def test_four_hour_bar_no_trade_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+
+    def fake_derive_four_hour_bar(*args, **kwargs) -> FourHourBarResult:
+        return FourHourBarResult(
+            status=FourHourBarStatus.NO_TRADE,
+            market="KRW-BTC",
+            start_time_utc=start,
+            end_time_utc=start + timedelta(hours=4),
+            expected_count=240,
+            resolved_count=240,
+            traded_count=0,
+            no_trade_count=240,
+            unresolved_count=0,
+            unresolved_minute_starts=(),
+            candle=None,
+            reason=None,
+        )
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.derive_four_hour_bar",
+        fake_derive_four_hour_bar,
+    )
+
+    exit_code = main(
+        [
+            "four-hour-bar",
+            "KRW-BTC",
+            "--start",
+            "2026-08-22T12:00:00Z",
+            "--as-of",
+            "2026-08-22T16:10:00Z",
+            "--database",
+            str(tmp_path / "cassandra.db"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        "status=NO_TRADE\n"
+        "market=KRW-BTC\n"
+        "start_time_utc=2026-08-22T12:00:00Z\n"
+        "end_time_utc=2026-08-22T16:00:00Z\n"
+        "expected_count=240\n"
+        "resolved_count=240\n"
+        "traded_count=0\n"
+        "no_trade_count=240\n"
+        "unresolved_count=0\n"
     )
 
 
@@ -532,8 +595,11 @@ def test_four_hour_bar_incomplete_output(
             start_time_utc=start,
             end_time_utc=start + timedelta(hours=4),
             expected_count=240,
-            actual_count=239,
-            missing_minute_starts=(missing,),
+            resolved_count=239,
+            traded_count=238,
+            no_trade_count=1,
+            unresolved_count=1,
+            unresolved_minute_starts=(missing,),
             candle=None,
             reason=FourHourBarReason.MISSING_MINUTES,
         )
@@ -565,9 +631,14 @@ def test_four_hour_bar_incomplete_output(
         "start_time_utc=2026-08-22T12:00:00Z\n"
         "end_time_utc=2026-08-22T16:00:00Z\n"
         "reason=MISSING_MINUTES\n"
-        "actual_count=239\n"
+        "actual_count=238\n"
         "expected_count=240\n"
         "missing_count=1\n"
+        "resolved_count=239\n"
+        "traded_count=238\n"
+        "no_trade_count=1\n"
+        "unresolved_count=1\n"
+        "unresolved_minute_starts=2026-08-22T12:42:00Z\n"
     )
 
 

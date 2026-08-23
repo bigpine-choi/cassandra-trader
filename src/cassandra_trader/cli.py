@@ -526,7 +526,23 @@ def _print_four_hour_bar(
         print(f"actual_count={result.actual_count}")
         print(f"expected_count={result.expected_count}")
         print(f"missing_count={len(result.missing_minute_starts)}")
+        print(f"resolved_count={result.resolved_count}")
+        print(f"traded_count={result.traded_count}")
+        print(f"no_trade_count={result.no_trade_count}")
+        print(f"unresolved_count={result.unresolved_count}")
+        print(
+            "unresolved_minute_starts="
+            + ",".join(_optional_utc_text(start) for start in result.unresolved_minute_starts)
+        )
         return 2
+
+    if result.status is FourHourBarStatus.NO_TRADE:
+        print(f"expected_count={result.expected_count}")
+        print(f"resolved_count={result.resolved_count}")
+        print(f"traded_count={result.traded_count}")
+        print(f"no_trade_count={result.no_trade_count}")
+        print(f"unresolved_count={result.unresolved_count}")
+        return 0
 
     if result.candle is None:
         raise RuntimeError("COMPLETE result must contain a four-hour candle")
@@ -537,6 +553,11 @@ def _print_four_hour_bar(
     print(f"close={result.candle.close}")
     print(f"base_volume={result.candle.base_volume}")
     print(f"quote_volume={result.candle.quote_volume}")
+    print(f"expected_count={result.expected_count}")
+    print(f"resolved_count={result.resolved_count}")
+    print(f"traded_count={result.traded_count}")
+    print(f"no_trade_count={result.no_trade_count}")
+    print(f"unresolved_count={result.unresolved_count}")
     return 0
 
 

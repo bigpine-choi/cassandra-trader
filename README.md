@@ -24,7 +24,7 @@
 - [x] 단일 마켓 구간 백필과 `as_of` canonical 조회
 - [x] 명시적 복수 KRW 마켓의 순차 백필, 종목별 coverage와 JSONL 결과
 - [x] bounded backfill 실행 증거와 point-in-time 1분 slot 상태 판정
-- [x] canonical 1분봉 기반 완결 UTC 4시간봉 파생
+- [x] point-in-time resolved minute slot 기반 UTC 4시간봉 파생
 - [x] 공개 WebSocket ticker·1분봉 수신, 재연결과 REST reconciliation
 - [ ] point-in-time 투자 유니버스
 - [ ] 백테스트 및 페이퍼 트레이딩
@@ -78,6 +78,8 @@ uv run cassandra-trader backfill-dataset \
 입력 마켓은 trim·대문자화 후 중복 제거·사전순 처리됩니다. 각 마켓의 백필 통계와 `[start, end)` canonical coverage를 JSON Lines로 출력하고, 마지막 줄에 전체 summary를 출력합니다. 일부 마켓이 실패해도 다음 마켓을 계속 처리하며 최종 종료 코드는 0이 아닙니다. `absent_slots`는 관측되지 않은 분 수만 나타내며 무거래 또는 장애를 판정하거나 분봉을 합성하지 않습니다.
 
 분 단위 상태는 `as_of`까지 이용 가능한 증거를 canonical 우선으로 결합합니다. canonical candle이 있으면 `TRADED`, candle은 없지만 해당 분 전체를 덮는 성공한 bounded backfill 증거가 있으면 `NO_TRADE`, 둘 다 없으면 `UNRESOLVED`입니다. 실패한 backfill은 `NO_TRADE` 증거가 아니며 어떤 상태에서도 가격을 합성하거나 forward-fill하지 않습니다.
+
+4시간봉은 정확히 240개의 point-in-time minute slot에서 파생합니다. 하나라도 `UNRESOLVED`이면 부분 OHLCV 없이 `INCOMPLETE`, 모두 `NO_TRADE`이면 관측이 완료된 `NO_TRADE`를 반환합니다. 그 밖에는 `COMPLETE`이며 실제 `TRADED` candle만 OHLCV에 사용합니다. `NO_TRADE` 분의 가격·거래량을 합성하거나 이전 가격으로 forward-fill하지 않습니다. 기존 `actual_count`는 실제 `TRADED` candle 수, `missing_minute_starts`는 `UNRESOLVED` 분 시작 목록을 뜻합니다.
 
 단일 마켓 백필과 완결 4시간봉 조회:
 
