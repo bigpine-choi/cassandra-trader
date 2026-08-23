@@ -9,8 +9,15 @@ from cassandra_trader.adapters.storage.sqlite import (
     MinuteCandleBackfillRunStatus,
     RawMinuteCandleInput,
     SqliteMinuteCandleRepository,
+    StoredMinuteCandle,
+    StoredMinuteCandleBackfillRun,
 )
-from cassandra_trader.apps.minute_slots import resolve_minute_slots
+from cassandra_trader.apps.minute_slots import (
+    resolve_minute_slots,
+    resolve_minute_slots_from_repository,
+    summarize_minute_slots,
+    summarize_minute_slots_from_repository,
+)
 from cassandra_trader.domain.candle import MinuteCandle
 from cassandra_trader.domain.minute_slot import MinuteSlotStatus
 
@@ -336,3 +343,354 @@ def test_resolver_selects_latest_canonical_revision_available_as_of(
     assert after_revision[0].canonical_revision == 2
     assert after_revision[0].candle is not None
     assert after_revision[0].candle.close == Decimal("10.75")
+
+
+def test_thirty_day_summary_counts_43200_no_trade_slots_without_materializing_slots(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    start = end - timedelta(days=30)
+    available_at = end + timedelta(seconds=1)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _record_run(
+            repository,
+            run_id="thirty-days",
+            start=start,
+            end=end,
+            observed_at=end,
+            available_at=available_at,
+        )
+
+    summary = summarize_minute_slots("KRW-BTC", start, end, available_at, database)
+
+    assert summary.expected_count == 43_200
+    assert summary.traded_count == 0
+    assert summary.no_trade_count == 43_200
+    assert summary.unresolved_count == 0
+    assert summary.quote_volume == Decimal(0)
+
+
+def test_summary_matches_resolver_and_counts_canonical_before_absence_evidence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = _START + timedelta(minutes=4)
+    first = replace(_candle(_START + timedelta(minutes=1)), quote_volume=Decimal("10.123456789"))
+    second = replace(_candle(_START + timedelta(minutes=3)), quote_volume=Decimal("0.000000011"))
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest_candle(repository, first, batch_id="first", available_at=_AVAILABLE)
+        _ingest_candle(repository, second, batch_id="second", available_at=_AVAILABLE)
+        _record_run(
+            repository,
+            run_id="complete",
+            start=_START,
+            end=end,
+            observed_at=end,
+            available_at=_AVAILABLE,
+        )
+
+    summary = summarize_minute_slots("KRW-BTC", _START, end, _AVAILABLE, database)
+    slots = resolve_minute_slots("KRW-BTC", _START, end, _AVAILABLE, database)
+
+    assert summary.traded_count == sum(slot.status is MinuteSlotStatus.TRADED for slot in slots)
+    assert summary.no_trade_count == sum(slot.status is MinuteSlotStatus.NO_TRADE for slot in slots)
+    assert summary.unresolved_count == sum(
+        slot.status is MinuteSlotStatus.UNRESOLVED for slot in slots
+    )
+    assert summary.traded_count == 2
+    assert summary.no_trade_count == 2
+    assert summary.quote_volume == Decimal("10.123456800")
+
+
+def test_summary_merges_fractional_overlapping_and_adjacent_evidence_inward() -> None:
+    end = _START + timedelta(minutes=4)
+    runs = (
+        StoredMinuteCandleBackfillRun(
+            run_id="fractional-left",
+            market="KRW-BTC",
+            requested_start=_START + timedelta(seconds=30),
+            requested_end=_START + timedelta(minutes=2),
+            observed_at=_START + timedelta(minutes=2),
+            available_at=_AVAILABLE,
+            status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+            error_type=None,
+            error_message=None,
+        ),
+        StoredMinuteCandleBackfillRun(
+            run_id="overlap",
+            market="KRW-BTC",
+            requested_start=_START + timedelta(minutes=1, seconds=30),
+            requested_end=end,
+            observed_at=_START + timedelta(minutes=3, seconds=30),
+            available_at=_AVAILABLE,
+            status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+            error_type=None,
+            error_message=None,
+        ),
+        StoredMinuteCandleBackfillRun(
+            run_id="adjacent",
+            market="KRW-BTC",
+            requested_start=_START + timedelta(minutes=3, seconds=30),
+            requested_end=end,
+            observed_at=end,
+            available_at=_AVAILABLE,
+            status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+            error_type=None,
+            error_message=None,
+        ),
+    )
+
+    class FakeRepository:
+        def list_minute_candles_as_of(self, *args, **kwargs):
+            return ()
+
+        def list_minute_candle_backfill_runs(self, *args, **kwargs):
+            return runs
+
+    summary = summarize_minute_slots_from_repository(
+        "KRW-BTC",
+        _START,
+        end,
+        _AVAILABLE,
+        FakeRepository(),  # type: ignore[arg-type]
+    )
+
+    assert summary.expected_count == 4
+    assert summary.traded_count == 0
+    assert summary.no_trade_count == 3
+    assert summary.unresolved_count == 1
+
+
+def test_summary_respects_canonical_revision_and_future_evidence_availability(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    end = _START + timedelta(minutes=2)
+    revised = replace(_candle(), quote_volume=Decimal("20.000000001"))
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        _ingest_candle(repository, _candle(), batch_id="revision-1", available_at=_AVAILABLE)
+        _ingest_candle(repository, revised, batch_id="revision-2", available_at=_LATE)
+        _record_run(
+            repository,
+            run_id="future-success",
+            start=_START,
+            end=end,
+            observed_at=end,
+            available_at=_LATE,
+        )
+        _record_run(
+            repository,
+            run_id="failed",
+            start=_START,
+            end=end,
+            observed_at=end,
+            available_at=_AVAILABLE,
+            status=MinuteCandleBackfillRunStatus.FAILED,
+        )
+
+    earlier = summarize_minute_slots("KRW-BTC", _START, end, _AVAILABLE, database)
+    later = summarize_minute_slots("KRW-BTC", _START, end, _LATE, database)
+
+    assert earlier.traded_count == 1
+    assert earlier.no_trade_count == 0
+    assert earlier.unresolved_count == 1
+    assert earlier.quote_volume == Decimal("10.5")
+    assert later.traded_count == 1
+    assert later.no_trade_count == 1
+    assert later.unresolved_count == 0
+    assert later.quote_volume == Decimal("20.000000001")
+
+
+def test_summary_is_differentially_equivalent_to_slot_resolver_across_boundaries() -> None:
+    """Keep the optimized interval arithmetic identical to the slot contract."""
+
+    end = _START + timedelta(minutes=6)
+
+    def stored(
+        minute: int,
+        quote_volume: str,
+        revision: int = 1,
+        available_at: datetime = _AVAILABLE,
+    ) -> StoredMinuteCandle:
+        start = _START + timedelta(minutes=minute)
+        candle = replace(_candle(start), quote_volume=Decimal(quote_volume))
+        return StoredMinuteCandle(
+            candle=candle,
+            revision=revision,
+            content_sha256=f"{revision:064x}",
+            source_raw_record_id=revision,
+            available_at=available_at,
+        )
+
+    def run(
+        run_id: str,
+        start_minutes: float,
+        end_minutes: float,
+        *,
+        observed_minutes: float | None = None,
+        available_at: datetime = _AVAILABLE,
+        status: MinuteCandleBackfillRunStatus = MinuteCandleBackfillRunStatus.SUCCEEDED,
+    ) -> StoredMinuteCandleBackfillRun:
+        return StoredMinuteCandleBackfillRun(
+            run_id=run_id,
+            market="KRW-BTC",
+            requested_start=_START + timedelta(minutes=start_minutes),
+            requested_end=_START + timedelta(minutes=end_minutes),
+            observed_at=_START
+            + timedelta(minutes=end_minutes if observed_minutes is None else observed_minutes),
+            available_at=available_at,
+            status=status,
+            error_type=("TimeoutError" if status is MinuteCandleBackfillRunStatus.FAILED else None),
+            error_message=(
+                "request timed out" if status is MinuteCandleBackfillRunStatus.FAILED else None
+            ),
+        )
+
+    cases = (
+        ("canonical-only", _AVAILABLE, (stored(0, "1.25"), stored(5, "2.75")), ()),
+        ("successful-evidence-only", _AVAILABLE, (), (run("full", 0, 6),)),
+        (
+            "canonical-overlapping-evidence",
+            _AVAILABLE,
+            (stored(2, "3.5"),),
+            (run("full-with-canonical", 0, 6),),
+        ),
+        (
+            "failed-evidence",
+            _AVAILABLE,
+            (),
+            (run("failed", 0, 6, status=MinuteCandleBackfillRunStatus.FAILED),),
+        ),
+        (
+            "overlapping-and-adjacent-evidence",
+            _AVAILABLE,
+            (stored(2, "4"),),
+            (run("overlap-left", 0, 2.5), run("overlap-right", 2, 4), run("adjacent", 4, 6)),
+        ),
+        ("partial-first-and-last", _AVAILABLE, (), (run("partial-edges", 0.5, 5.5),)),
+        (
+            "fractional-observed-at-clip",
+            _AVAILABLE,
+            (),
+            (run("observed-clip", 0, 6, observed_minutes=3.5),),
+        ),
+        (
+            "before-later-canonical-revision",
+            _AVAILABLE,
+            (stored(1, "5", 1), stored(1, "9", 2, _LATE)),
+            (),
+        ),
+        (
+            "after-later-canonical-revision",
+            _LATE,
+            (stored(1, "5", 1), stored(1, "9", 2, _LATE)),
+            (),
+        ),
+        (
+            "exact-one-minute-gap",
+            _AVAILABLE,
+            (),
+            (run("gap-left", 0, 2), run("gap-right", 3, 6)),
+        ),
+        (
+            "range-boundary-touching-evidence",
+            _AVAILABLE,
+            (),
+            (
+                run("outside-left", -2, 0),
+                run("inside-left", 0, 1),
+                run("inside-right", 5, 6),
+                run("outside-right", 6, 8),
+            ),
+        ),
+    )
+
+    class DifferentialRepository:
+        def __init__(
+            self,
+            canonical: tuple[StoredMinuteCandle, ...],
+            runs: tuple[StoredMinuteCandleBackfillRun, ...],
+        ) -> None:
+            self.canonical = canonical
+            self.runs = runs
+
+        def list_minute_candles_as_of(
+            self,
+            market: str,
+            start_time_utc: datetime,
+            end_time_utc: datetime,
+            as_of: datetime,
+        ) -> tuple[StoredMinuteCandle, ...]:
+            latest: dict[datetime, StoredMinuteCandle] = {}
+
+            for item in self.canonical:
+                candle = item.candle
+                if (
+                    candle.market == market
+                    and start_time_utc <= candle.start_time_utc < end_time_utc
+                    and item.available_at <= as_of
+                    and (
+                        candle.start_time_utc not in latest
+                        or item.revision > latest[candle.start_time_utc].revision
+                    )
+                ):
+                    latest[candle.start_time_utc] = item
+
+            return tuple(latest[start] for start in sorted(latest))
+
+        def list_minute_candle_backfill_runs(
+            self,
+            market: str,
+            start_time_utc: datetime,
+            end_time_utc: datetime,
+            as_of: datetime,
+            *,
+            status: MinuteCandleBackfillRunStatus | None = None,
+        ) -> tuple[StoredMinuteCandleBackfillRun, ...]:
+            return tuple(
+                item
+                for item in self.runs
+                if item.market == market
+                and item.requested_start < end_time_utc
+                and item.requested_end > start_time_utc
+                and item.available_at <= as_of
+                and (status is None or item.status is status)
+            )
+
+    for case, as_of, canonical, runs in cases:
+        repository = DifferentialRepository(canonical, runs)
+        slots = resolve_minute_slots_from_repository(
+            "KRW-BTC",
+            _START,
+            end,
+            as_of,
+            repository,  # type: ignore[arg-type]
+        )
+        summary = summarize_minute_slots_from_repository(
+            "KRW-BTC",
+            _START,
+            end,
+            as_of,
+            repository,  # type: ignore[arg-type]
+        )
+        traded_slots = tuple(slot for slot in slots if slot.status is MinuteSlotStatus.TRADED)
+
+        assert summary.expected_count == len(slots), case
+        assert summary.traded_count == len(traded_slots), case
+        assert summary.no_trade_count == sum(
+            slot.status is MinuteSlotStatus.NO_TRADE for slot in slots
+        ), case
+        assert summary.unresolved_count == sum(
+            slot.status is MinuteSlotStatus.UNRESOLVED for slot in slots
+        ), case
+        assert summary.quote_volume == sum(
+            (slot.candle.quote_volume for slot in traded_slots if slot.candle is not None),
+            start=Decimal(0),
+        ), case
+        assert summary.expected_count == (
+            summary.traded_count + summary.no_trade_count + summary.unresolved_count
+        ), case
