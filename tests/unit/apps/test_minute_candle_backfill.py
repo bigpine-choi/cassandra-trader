@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from cassandra_trader.adapters.storage.sqlite import SqliteMinuteCandleRepository
+from cassandra_trader.adapters.storage.sqlite import (
+    MinuteCandleBackfillRunStatus,
+    SqliteMinuteCandleRepository,
+)
 from cassandra_trader.adapters.upbit.public_data import (
     MinuteCandleObservation,
     MinuteCandleResponseBatch,
@@ -114,6 +117,20 @@ def test_backfill_collects_two_pages_and_moves_cursor(tmp_path: Path) -> None:
     assert result.requested_start == _START
     assert result.requested_end == _END
 
+    with SqliteMinuteCandleRepository(tmp_path / "candles.db") as repository:
+        runs = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            _END,
+            datetime(2100, 1, 1, tzinfo=UTC),
+        )
+    assert len(runs) == 1
+    assert runs[0].status is MinuteCandleBackfillRunStatus.SUCCEEDED
+    assert runs[0].requested_start == _START
+    assert runs[0].requested_end == _END
+    assert runs[0].observed_at == _OBSERVED_AT
+    assert runs[0].error_type is None
+
 
 def test_backfill_applies_exact_half_open_canonical_range(tmp_path: Path) -> None:
     starts = [_END]
@@ -184,6 +201,97 @@ def test_cursor_that_does_not_move_backward_fails(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="cursor did not move backward"):
         _run_backfill(tmp_path / "candles.db", fetcher)
+
+
+def test_second_page_failure_records_failed_run_and_reraises_original_error(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+    failure = TimeoutError("second page timed out")
+    call_count = 0
+
+    async def fetch_page(
+        market: str,
+        count: int,
+        *,
+        as_of: datetime,
+        to: datetime,
+    ) -> MinuteCandleResponseBatch:
+        nonlocal call_count
+        call_count += 1
+
+        if call_count == 2:
+            raise failure
+
+        return MinuteCandleResponseBatch(
+            endpoint="/v1/candles/minutes/1",
+            request_parameters={"market": market, "count": count},
+            received_at=_OBSERVED_AT,
+            observations=_page([_START + timedelta(minutes=offset) for offset in range(40, 240)]),
+        )
+
+    with pytest.raises(TimeoutError) as caught:
+        asyncio.run(
+            backfill_minute_candles_with_fetcher(
+                "KRW-BTC",
+                _START,
+                _END,
+                database,
+                fetch_page=fetch_page,
+                observed_at=_OBSERVED_AT,
+            )
+        )
+
+    assert caught.value is failure
+    with SqliteMinuteCandleRepository(database) as repository:
+        runs = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            _END,
+            datetime(2100, 1, 1, tzinfo=UTC),
+        )
+        stored = repository.list_minute_candles_as_of(
+            "KRW-BTC",
+            _START,
+            _END,
+            datetime(2100, 1, 1, tzinfo=UTC),
+        )
+
+    assert len(stored) == 200
+    assert len(runs) == 1
+    assert runs[0].status is MinuteCandleBackfillRunStatus.FAILED
+    assert runs[0].error_type == "TimeoutError"
+    assert runs[0].error_message == "second page timed out"
+
+
+def test_cancelled_backfill_propagates_control_flow_without_terminal_evidence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "candles.db"
+
+    async def cancelled_fetch(*args, **kwargs) -> MinuteCandleResponseBatch:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            backfill_minute_candles_with_fetcher(
+                "KRW-BTC",
+                _START,
+                _END,
+                database,
+                fetch_page=cancelled_fetch,
+                observed_at=_OBSERVED_AT,
+            )
+        )
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        runs = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            _END,
+            datetime(2100, 1, 1, tzinfo=UTC),
+        )
+    assert runs == ()
 
 
 def test_missing_minutes_are_not_synthesized(tmp_path: Path) -> None:

@@ -7,12 +7,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 
 from cassandra_trader.domain.candle import MinuteCandle
 
-_SCHEMA_VERSION = 1
-_SCHEMA_SQL = """
+_SCHEMA_VERSION = 2
+_SCHEMA_V1_SQL = """
 CREATE TABLE raw_ingestion_batches (
     batch_id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -91,6 +92,68 @@ BEGIN
 END;
 """
 
+_SCHEMA_V2_SQL = """
+CREATE TABLE minute_candle_backfill_runs (
+    run_id TEXT PRIMARY KEY,
+    market TEXT NOT NULL,
+    requested_start TEXT NOT NULL,
+    requested_end TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('SUCCEEDED', 'FAILED')),
+    error_type TEXT,
+    error_message TEXT,
+    CHECK (requested_start < requested_end),
+    CHECK (
+        length(observed_at) = 27
+        AND substr(observed_at, 20, 1) = '.'
+        AND substr(observed_at, 27, 1) = 'Z'
+    ),
+    CHECK (
+        length(available_at) = 27
+        AND substr(available_at, 20, 1) = '.'
+        AND substr(available_at, 27, 1) = 'Z'
+    ),
+    CHECK (observed_at <= available_at),
+    CHECK (
+        (status = 'SUCCEEDED' AND error_type IS NULL AND error_message IS NULL)
+        OR
+        (status = 'FAILED' AND error_type IS NOT NULL AND length(trim(error_type)) > 0)
+    )
+);
+
+CREATE INDEX minute_candle_backfill_runs_lookup
+ON minute_candle_backfill_runs (
+    market,
+    status,
+    (CASE
+        WHEN instr(available_at, '.') = 0
+        THEN substr(available_at, 1, 19) || '.000000Z'
+        ELSE available_at
+    END),
+    requested_start,
+    requested_end,
+    observed_at
+);
+
+CREATE TRIGGER minute_candle_backfill_runs_no_update
+BEFORE UPDATE ON minute_candle_backfill_runs
+BEGIN
+    SELECT RAISE(ABORT, 'minute candle backfill runs are append-only');
+END;
+
+CREATE TRIGGER minute_candle_backfill_runs_no_delete
+BEFORE DELETE ON minute_candle_backfill_runs
+BEGIN
+    SELECT RAISE(ABORT, 'minute candle backfill runs are append-only');
+END;
+"""
+
+_MIGRATIONS = (
+    (1, _SCHEMA_V1_SQL),
+    (2, _SCHEMA_V2_SQL),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RawMinuteCandleInput:
@@ -140,6 +203,28 @@ class CanonicalMinuteCandleCoverage:
     latest_candle_time: datetime | None
 
 
+class MinuteCandleBackfillRunStatus(StrEnum):
+    """Terminal outcome of one bounded minute-candle backfill run."""
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMinuteCandleBackfillRun:
+    """Immutable bounded backfill evidence loaded from SQLite."""
+
+    run_id: str
+    market: str
+    requested_start: datetime
+    requested_end: datetime
+    observed_at: datetime
+    available_at: datetime
+    status: MinuteCandleBackfillRunStatus
+    error_type: str | None
+    error_message: str | None
+
+
 class SqliteMinuteCandleRepository:
     """Persist raw observations and immutable canonical candle revisions."""
 
@@ -178,7 +263,7 @@ class SqliteMinuteCandleRepository:
 
         effective_ingested_at = ingested_at or datetime.now(UTC)
         received_text = _utc_text(received_at)
-        ingested_text = _utc_text(effective_ingested_at)
+        ingested_text = _utc_availability_text(effective_ingested_at)
 
         if received_at > effective_ingested_at:
             raise ValueError("received_at must not be after ingested_at")
@@ -370,13 +455,14 @@ class SqliteMinuteCandleRepository:
 
         start_text = _utc_text(start_time_utc)
         end_text = _utc_text(end_time_utc)
-        as_of_text = _utc_text(as_of)
+        as_of_text = _utc_availability_text(as_of)
+        available_at_key = _utc_comparison_key_sql("available_at")
 
         if start_time_utc >= end_time_utc:
             raise ValueError("start_time_utc must be before end_time_utc")
 
         rows = self._connection.execute(
-            """
+            f"""
             WITH available_revisions AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -387,7 +473,7 @@ class SqliteMinuteCandleRepository:
                 WHERE market = ?
                   AND start_time_utc >= ?
                   AND start_time_utc < ?
-                  AND available_at <= ?
+                  AND {available_at_key} <= ?
             )
             SELECT *
             FROM available_revisions
@@ -411,10 +497,11 @@ class SqliteMinuteCandleRepository:
         _validate_minute_range(start_time_utc, end_time_utc)
         start_text = _utc_text(start_time_utc)
         end_text = _utc_text(end_time_utc)
-        as_of_text = _utc_text(as_of)
+        as_of_text = _utc_availability_text(as_of)
+        available_at_key = _utc_comparison_key_sql("available_at")
         expected_slots = int((end_time_utc - start_time_utc) // timedelta(minutes=1))
         row = self._connection.execute(
-            """
+            f"""
             SELECT COUNT(DISTINCT start_time_utc) AS observed_slots,
                    MIN(start_time_utc) AS earliest_candle_time,
                    MAX(start_time_utc) AS latest_candle_time
@@ -422,7 +509,7 @@ class SqliteMinuteCandleRepository:
             WHERE market = ?
               AND start_time_utc >= ?
               AND start_time_utc < ?
-              AND available_at <= ?
+              AND {available_at_key} <= ?
             """,
             (market, start_text, end_text, as_of_text),
         ).fetchone()
@@ -446,6 +533,109 @@ class SqliteMinuteCandleRepository:
             ),
         )
 
+    def record_minute_candle_backfill_run(
+        self,
+        *,
+        run_id: str,
+        market: str,
+        requested_start: datetime,
+        requested_end: datetime,
+        observed_at: datetime,
+        status: MinuteCandleBackfillRunStatus,
+        available_at: datetime | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Append terminal evidence for one bounded minute-candle backfill."""
+
+        if not run_id.strip():
+            raise ValueError("run_id must not be empty")
+
+        if not market.strip():
+            raise ValueError("market must not be empty")
+
+        _validate_minute_range(requested_start, requested_end)
+        effective_available_at = available_at or datetime.now(UTC)
+        status = MinuteCandleBackfillRunStatus(status)
+        observed_text = _utc_availability_text(observed_at)
+        available_text = _utc_availability_text(effective_available_at)
+
+        if observed_text > available_text:
+            raise ValueError("observed_at must not be after available_at")
+
+        if status is MinuteCandleBackfillRunStatus.SUCCEEDED and (
+            error_type is not None or error_message is not None
+        ):
+            raise ValueError("SUCCEEDED backfill run must not include error information")
+
+        if status is MinuteCandleBackfillRunStatus.FAILED and (
+            error_type is None or not error_type.strip()
+        ):
+            raise ValueError("FAILED backfill run must include an error type")
+
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO minute_candle_backfill_runs (
+                    run_id, market, requested_start, requested_end,
+                    observed_at, available_at, status, error_type, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    market,
+                    _utc_text(requested_start),
+                    _utc_text(requested_end),
+                    observed_text,
+                    available_text,
+                    status.value,
+                    error_type,
+                    error_message,
+                ),
+            )
+
+    def list_minute_candle_backfill_runs(
+        self,
+        market: str,
+        start_time_utc: datetime,
+        end_time_utc: datetime,
+        as_of: datetime,
+        *,
+        status: MinuteCandleBackfillRunStatus | None = None,
+    ) -> tuple[StoredMinuteCandleBackfillRun, ...]:
+        """Return point-in-time backfill evidence overlapping one UTC range."""
+
+        _validate_minute_range(start_time_utc, end_time_utc)
+        parameters: list[str] = [
+            market,
+            _utc_text(end_time_utc),
+            _utc_text(start_time_utc),
+            _utc_availability_text(as_of),
+        ]
+        status_clause = ""
+
+        if status is not None:
+            normalized_status = MinuteCandleBackfillRunStatus(status)
+            status_clause = "AND status = ?"
+            parameters.append(normalized_status.value)
+
+        available_at_key = _utc_comparison_key_sql("available_at")
+        rows = self._connection.execute(
+            f"""
+            SELECT *
+            FROM minute_candle_backfill_runs
+            WHERE market = ?
+              AND requested_start < ?
+              AND requested_end > ?
+              AND {available_at_key} <= ?
+              {status_clause}
+            ORDER BY {available_at_key}, run_id
+            """,
+            parameters,
+        ).fetchall()
+
+        return tuple(_stored_backfill_run(row) for row in rows)
+
     def _migrate(self) -> None:
         self._connection.execute("BEGIN IMMEDIATE")
 
@@ -458,18 +648,26 @@ class SqliteMinuteCandleRepository:
                 )
                 """
             )
-            applied = self._connection.execute(
-                "SELECT 1 FROM schema_migrations WHERE version = ?",
-                (_SCHEMA_VERSION,),
-            ).fetchone()
+            applied_versions = {
+                row["version"]
+                for row in self._connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
 
-            if applied is None:
-                for statement in _schema_statements():
+            if any(version > _SCHEMA_VERSION for version in applied_versions):
+                raise RuntimeError("database schema is newer than this application")
+
+            for version, migration_sql in _MIGRATIONS:
+                if version in applied_versions:
+                    continue
+
+                for statement in _schema_statements(migration_sql):
                     self._connection.execute(statement)
 
                 self._connection.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (_SCHEMA_VERSION, _utc_text(datetime.now(UTC))),
+                    (version, _utc_text(datetime.now(UTC))),
                 )
 
             self._connection.commit()
@@ -557,6 +755,20 @@ def _stored_candle(row: sqlite3.Row) -> StoredMinuteCandle:
     )
 
 
+def _stored_backfill_run(row: sqlite3.Row) -> StoredMinuteCandleBackfillRun:
+    return StoredMinuteCandleBackfillRun(
+        run_id=row["run_id"],
+        market=row["market"],
+        requested_start=_parse_utc(row["requested_start"]),
+        requested_end=_parse_utc(row["requested_end"]),
+        observed_at=_parse_utc(row["observed_at"]),
+        available_at=_parse_utc(row["available_at"]),
+        status=MinuteCandleBackfillRunStatus(row["status"]),
+        error_type=row["error_type"],
+        error_message=row["error_message"],
+    )
+
+
 def _decimal_text(value: Decimal) -> str:
     if not value.is_finite():
         raise ValueError("canonical decimals must be finite")
@@ -577,6 +789,20 @@ def _utc_text(value: datetime) -> str:
         raise ValueError("timestamps must be timezone-aware UTC")
 
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _utc_availability_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("timestamps must be timezone-aware UTC")
+
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _utc_comparison_key_sql(column: str) -> str:
+    return (
+        f"CASE WHEN instr({column}, '.') = 0 "
+        f"THEN substr({column}, 1, 19) || '.000000Z' ELSE {column} END"
+    )
 
 
 def _validate_minute_range(start: datetime, end: datetime) -> None:
@@ -610,11 +836,11 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _schema_statements() -> tuple[str, ...]:
+def _schema_statements(migration_sql: str) -> tuple[str, ...]:
     statements: list[str] = []
     buffer: list[str] = []
 
-    for line in _SCHEMA_SQL.splitlines():
+    for line in migration_sql.splitlines():
         buffer.append(line)
         candidate = "\n".join(buffer).strip()
 
