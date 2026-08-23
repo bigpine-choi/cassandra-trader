@@ -12,12 +12,14 @@ from cassandra_trader.adapters.upbit.public_data import (
     MinuteCandleObservation,
     MinuteCandleResponseBatch,
 )
+from cassandra_trader.apps.minute_slots import resolve_minute_slots
 from cassandra_trader.apps.multi_market_dataset import (
     DatasetMarketStatus,
     backfill_multi_market_dataset,
     backfill_multi_market_dataset_with_fetcher,
 )
 from cassandra_trader.domain.candle import MinuteCandle
+from cassandra_trader.domain.minute_slot import MinuteSlotStatus
 
 _START = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
 _END = _START + timedelta(minutes=3)
@@ -119,9 +121,16 @@ def test_normalizes_deduplicates_sorts_and_keeps_market_data_separate(
     with SqliteMinuteCandleRepository(database) as repository:
         btc = repository.list_minute_candles_as_of("KRW-BTC", _START, _END, _COVERAGE_AS_OF)
         xrp = repository.list_minute_candles_as_of("KRW-XRP", _START, _END, _COVERAGE_AS_OF)
+        btc_runs = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC", _START, _END, _COVERAGE_AS_OF
+        )
+        xrp_runs = repository.list_minute_candle_backfill_runs(
+            "KRW-XRP", _START, _END, _COVERAGE_AS_OF
+        )
     assert {item.candle.market for item in btc} == {"KRW-BTC"}
     assert {item.candle.market for item in xrp} == {"KRW-XRP"}
     assert len(btc) == len(xrp) == 2
+    assert len(btc_runs) == len(xrp_runs) == 1
 
 
 @pytest.mark.parametrize("markets", [[], ["BTC-USDT"], ["KRW-"], ["KRW-비트"]])
@@ -220,6 +229,16 @@ def test_second_page_failure_keeps_partial_coverage_and_continues(
     assert succeeded.backfill is not None
     assert result.summary.succeeded == 1
     assert result.summary.failed == 1
+
+    slots = resolve_minute_slots(
+        "KRW-BTC",
+        _START,
+        end,
+        _COVERAGE_AS_OF,
+        tmp_path / "candles.db",
+    )
+    assert slots[0].status is MinuteSlotStatus.UNRESOLVED
+    assert all(slot.status is MinuteSlotStatus.TRADED for slot in slots[1:])
 
 
 def test_repeated_range_has_no_new_or_revised_canonical_rows(tmp_path: Path) -> None:

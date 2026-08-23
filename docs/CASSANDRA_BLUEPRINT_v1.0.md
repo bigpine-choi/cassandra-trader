@@ -434,6 +434,7 @@ stateDiagram-v2
 | 계층 | 내용 | 성질 |
 |---|---|---|
 | Raw | REST/WebSocket 원응답, 수신시각, 요청·연결 메타데이터 | append-only, 재처리 가능 |
+| Backfill Evidence | bounded REST 조회 범위, 관측·가용 시각, 성공·실패 결과 | append-only, point-in-time 판정 근거 |
 | Canonical | 실시간 ticker, canonical 1분봉, 선별 trade·orderbook, market status | 스키마 버전·품질 플래그 |
 | Derived Bar | 완결 canonical 1분봉에서 집계한 완결 4시간봉 | UTC 경계, 구성 1분봉과 품질 계보 |
 | Feature | point-in-time 알파·레짐·위험 특징 | `as_of`, 코드·데이터 버전 |
@@ -441,6 +442,8 @@ stateDiagram-v2
 | Execution | 주문 의도, 거래소 주문, 체결, 수수료, 대사 결과 | 감사 가능한 영속 원장 |
 
 canonical 1분봉을 기본 시계열 데이터로 삼고, 결측·중복·무거래 구간을 구분해 품질 상태와 처리 결과를 기록한다. 완결 4시간봉은 완결된 canonical 1분봉을 UTC 경계에 맞춰 집계한 의사결정용 파생 데이터다. 4시간은 수집 주기가 아니라 정상 알파·레짐·포트폴리오 의사결정 주기이며, 거래소의 REST 240분봉만 직접 받아 유일한 원천으로 저장하지 않는다.
+
+1분 slot은 `as_of`까지 이용 가능한 증거를 다음 순서로 판정한다. canonical candle이 있으면 `TRADED`, candle은 없지만 slot 전체를 덮고 slot 종료 뒤 관측된 성공한 bounded backfill 증거가 있으면 `NO_TRADE`, 그 밖에는 `UNRESOLVED`다. 실패한 backfill은 이전 성공 증거를 무효화하지 않으며 그 자체로 `NO_TRADE`를 만들지 않는다. 세 상태 판정은 synthetic candle이나 forward-fill을 생성하지 않는다.
 
 연구 데이터는 Parquet + DuckDB를 기본 제안으로 하고, 운영 주문·상태 원장은 PostgreSQL을 기본 제안으로 한다. Redis나 Kafka는 필요성이 입증되기 전에는 도입하지 않는다.
 
@@ -742,8 +745,8 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | 프로젝트 기반 | `pyproject.toml`, lockfile, Python 3.12 패키지와 CLI 진입점 |
 | Upbit REST | 공식 Upbit SDK를 사용한 인증 없는 KRW 마켓 카탈로그, 최근 완결 1분봉, 페이지 기반 `[start, end)` 과거 1분봉 조회 |
 | Upbit WebSocket | 공개 ticker·1분봉 정규화, 중복 제거, ping/pong, 지수 backoff와 jitter를 적용한 재연결·재구독 |
-| 저장 | SQLite append-only raw batch·record와 immutable canonical 1분봉 revision, 원자적 적재와 batch replay 멱등성 |
-| point-in-time 조회 | `[start, end)`와 `as_of` 기준으로 분당 최신 가용 revision을 선택하는 canonical slice 및 logical coverage |
+| 저장 | SQLite ordered migration v2, append-only raw batch·record, immutable canonical revision과 bounded backfill 실행 증거 |
+| point-in-time 조회 | `[start, end)`와 `as_of` 기준 최신 canonical revision과 성공한 범위 증거를 결합한 `TRADED`·`NO_TRADE`·`UNRESOLVED` slot |
 | 데이터셋 백필 | 명시한 KRW 마켓을 정규화·중복 제거·사전순 정렬하고, 하나의 client·repository로 순차 처리하며 종목 실패를 격리하는 서비스 |
 | coverage 의미 | `expected_slots`, `observed_slots`, 중립적 `absent_slots`, earliest/latest candle time을 보고하며 결측 분봉을 합성하지 않음 |
 | 파생 봉 | 완결 canonical 1분봉 240개가 정확히 존재할 때 UTC 4시간봉을 결정론적으로 생성하고, 누락 시 구조화된 incomplete 결과 반환 |
@@ -752,7 +755,7 @@ Live 모드가 명시적으로 활성화된 뒤에는 입출금과 손익이 반
 | 검증 | Ruff format·lint와 Pytest로 도메인, 저장, REST, WebSocket, 백필, coverage, CLI 회귀를 검사 |
 | 미구현 | point-in-time 유니버스, feature·label·모델·백테스트, 실시간 위험 감시, 선별 체결·호가, 계좌 조회, 주문·체결·대사 원장, paper/shadow/live 실행 |
 
-현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical 테이블만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. 복수 마켓 백필의 `absent_slots`는 아직 `NO_TRADE`나 데이터 장애로 분류하지 않는 중립적 관측 부재다.
+현재 명령은 공개 시장 데이터만 읽으며 주문을 생성하지 않는다. SQLite에는 시장 데이터 raw/canonical 및 bounded backfill evidence 테이블만 있으며 paper 원장이나 live broker가 이미 존재한다고 전제하지 않는다. coverage의 `absent_slots` 자체는 중립적 관측 부재이고, 성공한 범위 증거와 결합된 resolver만 `NO_TRADE`를 판정한다.
 
 이 문서의 point-in-time 유니버스, 모델, 포트폴리오, 위험, 주문, 계좌 대사와 운영 인프라 설계는 현재 구현 설명이 아니라 v1 목표 아키텍처다. 이후 구현은 각 로드맵 단계와 배포 게이트를 통과하면서 이 기준선에 수렴시킨다.
 
@@ -786,7 +789,7 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 4. 완료: 완결된 canonical 1분봉으로부터 UTC 경계의 완결 4시간봉 생성
 5. 완료: WebSocket ticker·1분봉 실시간 수집, 재연결과 REST reconciliation
 6. 완료: 명시적 복수 KRW 마켓 `[start, end)` 순차 백필과 canonical coverage 보고
-7. 현재 경계: `absent_slots`는 중립적으로만 기록하고 분봉을 합성하거나 원인을 확정하지 않음
+7. 완료: canonical과 성공한 bounded backfill 증거를 결합한 point-in-time 분 slot 상태 판정
 8. 이후 로드맵: point-in-time 유니버스와 백테스트에 필요한 재현 가능한 데이터셋 확장
 
 이 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 point-in-time 유니버스와 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.

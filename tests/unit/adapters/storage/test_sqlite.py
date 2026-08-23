@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from cassandra_trader.adapters.storage.sqlite import (
+    MinuteCandleBackfillRunStatus,
     RawMinuteCandleInput,
     SqliteMinuteCandleRepository,
 )
@@ -94,6 +95,64 @@ def _count(database: Path, table: str) -> int:
         return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
+def _create_v1_database(database: Path) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE raw_ingestion_batches (
+                batch_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                request_parameters_json TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                ingested_at TEXT NOT NULL
+            );
+            CREATE TABLE raw_minute_candles (
+                raw_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL REFERENCES raw_ingestion_batches(batch_id),
+                response_order INTEGER NOT NULL,
+                market TEXT NOT NULL,
+                source_candle_time TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE canonical_minute_candles (
+                canonical_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT NOT NULL,
+                start_time_utc TEXT NOT NULL,
+                end_time_utc TEXT NOT NULL,
+                open TEXT NOT NULL,
+                high TEXT NOT NULL,
+                low TEXT NOT NULL,
+                close TEXT NOT NULL,
+                base_volume TEXT NOT NULL,
+                quote_volume TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                source_raw_record_id INTEGER NOT NULL REFERENCES raw_minute_candles(raw_record_id),
+                available_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations VALUES (1, '2025-01-01T00:00:00Z');
+            INSERT INTO raw_ingestion_batches VALUES (
+                'legacy-batch', 'upbit', '/v1/candles/minutes/1', '{}',
+                '2025-01-01T12:02:00Z', '2025-01-01T12:02:01Z'
+            );
+            INSERT INTO raw_minute_candles VALUES (
+                1, 'legacy-batch', 0, 'KRW-BTC', '2025-01-01T12:00:00Z', '{}', 'raw-hash'
+            );
+            INSERT INTO canonical_minute_candles VALUES (
+                1, 'KRW-BTC', '2025-01-01T12:00:00Z', '2025-01-01T12:01:00Z',
+                '100', '110', '90', '105', '1.5', '150', 1, 'canonical-hash', 1,
+                '2025-01-01T12:02:01Z'
+            );
+            """
+        )
+
+
 def _record_for_candle(candle: MinuteCandle, response_order: int) -> RawMinuteCandleInput:
     source_time = candle.start_time_utc.isoformat().replace("+00:00", "Z")
 
@@ -127,7 +186,7 @@ def test_stores_first_raw_and_canonical_batch(tmp_path: Path) -> None:
     assert result.new_canonical_count == 1
     assert result.revised_canonical_count == 0
     assert result.unchanged_canonical_count == 0
-    assert _count(database, "schema_migrations") == 1
+    assert _count(database, "schema_migrations") == 2
     assert _count(database, "raw_ingestion_batches") == 1
     assert _count(database, "raw_minute_candles") == 1
     assert _count(database, "canonical_minute_candles") == 1
@@ -191,7 +250,91 @@ def test_reopening_database_does_not_repeat_migration(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,)]
+    assert versions == [(1,), (2,)]
+
+
+def test_existing_v1_database_preserves_canonical_data_when_v2_is_applied(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy.db"
+    _create_v1_database(database)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        stored = repository.get_current_minute_candle("KRW-BTC", _START)
+
+    assert stored is not None
+    assert stored.revision == 1
+    assert stored.candle.close == Decimal("105")
+    assert _count(database, "canonical_minute_candles") == 1
+    assert _count(database, "minute_candle_backfill_runs") == 0
+    with sqlite3.connect(database) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert versions == [(1,), (2,)]
+
+
+def test_backfill_run_evidence_enforces_status_contract_and_is_append_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cassandra.db"
+    end = _START + timedelta(minutes=3)
+
+    with SqliteMinuteCandleRepository(database) as repository:
+        repository.record_minute_candle_backfill_run(
+            run_id="run-success",
+            market="KRW-BTC",
+            requested_start=_START,
+            requested_end=end,
+            observed_at=_RECEIVED,
+            available_at=_RECEIVED + timedelta(seconds=1),
+            status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+        )
+        runs = repository.list_minute_candle_backfill_runs(
+            "KRW-BTC",
+            _START,
+            end,
+            _RECEIVED + timedelta(minutes=1),
+        )
+
+        with pytest.raises(ValueError, match="SUCCEEDED"):
+            repository.record_minute_candle_backfill_run(
+                run_id="bad-success",
+                market="KRW-BTC",
+                requested_start=_START,
+                requested_end=end,
+                observed_at=_RECEIVED,
+                status=MinuteCandleBackfillRunStatus.SUCCEEDED,
+                error_type="TimeoutError",
+            )
+
+        with pytest.raises(ValueError, match="FAILED"):
+            repository.record_minute_candle_backfill_run(
+                run_id="bad-failure",
+                market="KRW-BTC",
+                requested_start=_START,
+                requested_end=end,
+                observed_at=_RECEIVED,
+                status=MinuteCandleBackfillRunStatus.FAILED,
+            )
+
+    assert len(runs) == 1
+    assert runs[0].run_id == "run-success"
+    assert runs[0].status is MinuteCandleBackfillRunStatus.SUCCEEDED
+    assert runs[0].error_type is None
+    assert runs[0].error_message is None
+
+    with sqlite3.connect(database) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                "UPDATE minute_candle_backfill_runs SET market = ? WHERE run_id = ?",
+                ("KRW-XRP", "run-success"),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                "DELETE FROM minute_candle_backfill_runs WHERE run_id = ?",
+                ("run-success",),
+            )
 
 
 def test_replaying_same_recorded_batch_is_idempotent(tmp_path: Path) -> None:
