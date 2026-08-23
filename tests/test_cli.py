@@ -10,6 +10,13 @@ from cassandra_trader.adapters.upbit.public_stream import (
     LifecycleStatus,
     StreamLifecycleEvent,
 )
+from cassandra_trader.apps.liquidity_dataset_bootstrap import (
+    LiquidityDatasetBootstrapResult,
+    LiquidityDatasetBootstrapStatus,
+    LiquidityDatasetBootstrapSummary,
+    LiquidityDatasetMarketResult,
+    LiquidityDatasetMarketStatus,
+)
 from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
     RuntimeRecoveryKind,
@@ -48,6 +55,7 @@ from cassandra_trader.domain.market import (
 from cassandra_trader.domain.market_eligibility import (
     MARKET_ELIGIBILITY_POLICY_NAME,
     MARKET_ELIGIBILITY_POLICY_VERSION,
+    MarketEligibilityReason,
     MarketEligibilityResult,
     evaluate_market_eligibility,
 )
@@ -60,6 +68,12 @@ from cassandra_trader.domain.market_liquidity import (
 from cassandra_trader.domain.minute_slot import MinuteSlotSummary
 from cassandra_trader.domain.public_stream import StreamType, TickerEvent
 
+_BOOTSTRAP_WINDOW_END = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+_BOOTSTRAP_WINDOW_START = _BOOTSTRAP_WINDOW_END - timedelta(days=30)
+_BOOTSTRAP_UNIVERSE_AS_OF = _BOOTSTRAP_WINDOW_END + timedelta(minutes=1)
+_BOOTSTRAP_RESUME_AS_OF = _BOOTSTRAP_WINDOW_END + timedelta(minutes=2)
+_BOOTSTRAP_FINAL_AS_OF = _BOOTSTRAP_WINDOW_END + timedelta(minutes=3)
+
 
 def test_main(capsys: pytest.CaptureFixture[str]) -> None:
     main([])
@@ -67,6 +81,258 @@ def test_main(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
 
     assert captured.out == "Cassandra Trader\n"
+
+
+def _bootstrap_slot_summary(
+    market: str,
+    as_of: datetime,
+    *,
+    complete: bool,
+) -> MinuteSlotSummary:
+    return MinuteSlotSummary(
+        market=market,
+        start_time_utc=_BOOTSTRAP_WINDOW_START,
+        end_time_utc=_BOOTSTRAP_WINDOW_END,
+        as_of=as_of,
+        expected_count=43_200,
+        traded_count=0,
+        no_trade_count=43_200 if complete else 0,
+        unresolved_count=0 if complete else 43_200,
+        quote_volume=Decimal(0),
+    )
+
+
+def _bootstrap_cli_result(
+    statuses: tuple[tuple[str, LiquidityDatasetMarketStatus], ...],
+) -> LiquidityDatasetBootstrapResult:
+    markets = tuple(
+        LiquidityDatasetMarketResult(
+            market=market,
+            status=status,
+            initial_summary=_bootstrap_slot_summary(
+                market,
+                _BOOTSTRAP_RESUME_AS_OF,
+                complete=status is LiquidityDatasetMarketStatus.SKIPPED_COMPLETE,
+            ),
+            final_summary=_bootstrap_slot_summary(
+                market,
+                _BOOTSTRAP_FINAL_AS_OF,
+                complete=status is not LiquidityDatasetMarketStatus.FAILED,
+            ),
+            backfill=(
+                MinuteCandleBackfillResult(
+                    pages_fetched=1,
+                    raw_received=0,
+                    canonical_new=0,
+                    canonical_revised=0,
+                    canonical_unchanged=0,
+                    earliest_candle_time=None,
+                    latest_candle_time=None,
+                    requested_start=_BOOTSTRAP_WINDOW_START,
+                    requested_end=_BOOTSTRAP_WINDOW_END,
+                )
+                if status is LiquidityDatasetMarketStatus.SUCCEEDED
+                else None
+            ),
+            error_type=("TimeoutError" if status is LiquidityDatasetMarketStatus.FAILED else None),
+            error_message=("timed out" if status is LiquidityDatasetMarketStatus.FAILED else None),
+        )
+        for market, status in statuses
+    )
+    failed_count = sum(status is LiquidityDatasetMarketStatus.FAILED for _, status in statuses)
+    return LiquidityDatasetBootstrapResult(
+        markets=markets,
+        summary=LiquidityDatasetBootstrapSummary(
+            status=(
+                LiquidityDatasetBootstrapStatus.PARTIAL_FAILURE
+                if failed_count
+                else LiquidityDatasetBootstrapStatus.SUCCEEDED
+            ),
+            reasons=(),
+            quote_currency="KRW",
+            window_start=_BOOTSTRAP_WINDOW_START,
+            window_end=_BOOTSTRAP_WINDOW_END,
+            universe_as_of=_BOOTSTRAP_UNIVERSE_AS_OF,
+            resume_as_of=_BOOTSTRAP_RESUME_AS_OF,
+            final_coverage_as_of=_BOOTSTRAP_FINAL_AS_OF,
+            maximum_snapshot_age=timedelta(hours=1),
+            catalog_policy_name=MARKET_ELIGIBILITY_POLICY_NAME,
+            catalog_policy_version=MARKET_ELIGIBILITY_POLICY_VERSION,
+            snapshot_id="snapshot-cli",
+            observed_at=_BOOTSTRAP_WINDOW_END,
+            available_at=_BOOTSTRAP_WINDOW_END + timedelta(microseconds=1),
+            content_hash="a" * 64,
+            catalog_candidate_count=len(statuses),
+            catalog_excluded_count=0,
+            candidate_count=len(statuses),
+            succeeded_count=sum(
+                status is LiquidityDatasetMarketStatus.SUCCEEDED for _, status in statuses
+            ),
+            skipped_count=sum(
+                status is LiquidityDatasetMarketStatus.SKIPPED_COMPLETE for _, status in statuses
+            ),
+            failed_count=failed_count,
+        ),
+    )
+
+
+def _bootstrap_cli_args(database: Path) -> list[str]:
+    return [
+        "bootstrap-liquidity-dataset",
+        "--quote-currency",
+        "KRW",
+        "--universe-as-of",
+        "2026-08-23T12:01:00Z",
+        "--window-end",
+        "2026-08-23T12:00:00Z",
+        "--maximum-snapshot-age-seconds",
+        "3600",
+        "--database",
+        str(database),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_exit"),
+    [
+        (
+            _bootstrap_cli_result(
+                (
+                    ("KRW-BTC", LiquidityDatasetMarketStatus.SUCCEEDED),
+                    ("KRW-ETH", LiquidityDatasetMarketStatus.SKIPPED_COMPLETE),
+                )
+            ),
+            0,
+        ),
+        (
+            _bootstrap_cli_result(
+                (
+                    ("KRW-BTC", LiquidityDatasetMarketStatus.FAILED),
+                    ("KRW-ETH", LiquidityDatasetMarketStatus.SUCCEEDED),
+                )
+            ),
+            1,
+        ),
+    ],
+)
+def test_bootstrap_liquidity_dataset_outputs_sorted_jsonl_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    result: LiquidityDatasetBootstrapResult,
+    expected_exit: int,
+) -> None:
+    async def fake_bootstrap(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.bootstrap_liquidity_dataset",
+        fake_bootstrap,
+    )
+
+    exit_code = main(_bootstrap_cli_args(tmp_path / "candles.db"))
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    assert exit_code == expected_exit
+    assert [record["market"] for record in records[:-1]] == ["KRW-BTC", "KRW-ETH"]
+    assert all(record["type"] == "market" for record in records[:-1])
+    assert records[-1]["type"] == "summary"
+    assert records[-1]["candidate_count"] == 2
+    assert records[-1]["failed_count"] == expected_exit
+    assert records[-1]["coverage_as_of"] == "2026-08-23T12:03:00Z"
+    assert "final_coverage_as_of" not in records[-1]
+    assert records[0]["initial_slot_summary"]["quote_volume"] == "0"
+
+
+def test_bootstrap_liquidity_dataset_unresolved_outputs_summary_only_and_exit_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    result = LiquidityDatasetBootstrapResult(
+        markets=(),
+        summary=LiquidityDatasetBootstrapSummary(
+            status=LiquidityDatasetBootstrapStatus.UNRESOLVED,
+            reasons=(MarketEligibilityReason.UNIVERSE_UNRESOLVED,),
+            quote_currency="KRW",
+            window_start=_BOOTSTRAP_WINDOW_START,
+            window_end=_BOOTSTRAP_WINDOW_END,
+            universe_as_of=_BOOTSTRAP_UNIVERSE_AS_OF,
+            resume_as_of=_BOOTSTRAP_RESUME_AS_OF,
+            final_coverage_as_of=_BOOTSTRAP_RESUME_AS_OF,
+            maximum_snapshot_age=timedelta(hours=1),
+            catalog_policy_name=MARKET_ELIGIBILITY_POLICY_NAME,
+            catalog_policy_version=MARKET_ELIGIBILITY_POLICY_VERSION,
+            snapshot_id=None,
+            observed_at=None,
+            available_at=None,
+            content_hash=None,
+            catalog_candidate_count=0,
+            catalog_excluded_count=0,
+            candidate_count=0,
+            succeeded_count=0,
+            skipped_count=0,
+            failed_count=0,
+        ),
+    )
+
+    async def fake_bootstrap(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.bootstrap_liquidity_dataset",
+        fake_bootstrap,
+    )
+
+    exit_code = main(_bootstrap_cli_args(tmp_path / "candles.db"))
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    assert exit_code == 2
+    assert records == [
+        {
+            **records[0],
+            "type": "summary",
+            "status": "UNRESOLVED",
+            "candidate_count": 0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--quote-currency", "BTC"],
+        ["--universe-as-of", "2026-08-23T11:59:00Z"],
+        ["--window-end", "2026-08-23T12:00:00.000001Z"],
+        ["--maximum-snapshot-age-seconds", "0"],
+    ],
+)
+def test_bootstrap_liquidity_dataset_rejects_invalid_cli_input_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    called = False
+
+    async def unexpected_bootstrap(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid CLI input must not reach the service")
+
+    monkeypatch.setattr(
+        "cassandra_trader.cli.bootstrap_liquidity_dataset",
+        unexpected_bootstrap,
+    )
+    command = _bootstrap_cli_args(tmp_path / "candles.db")
+    option = arguments[0]
+    index = command.index(option)
+    command[index : index + 2] = arguments
+
+    with pytest.raises(SystemExit) as error:
+        main(command)
+
+    assert error.value.code == 2
+    assert called is False
 
 
 def test_markets_command(

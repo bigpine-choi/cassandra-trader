@@ -45,9 +45,10 @@ Blueprint의 거래 범위와 안전 불변조건은 연구 결과로 우회할 
 강화학습 기반 주문 의사결정, LLM 기반 실거래 주문 판단은 초기 연구 범위에서 제외한다.
 LLM은 문서·코드·연구 보조에 사용할 수 있지만 주문 경로의 입력이나 승인 주체가 될 수 없다.
 
-현재 저장소에 구현된 것은 Python 3.12와 `uv` 기반 패키지, 공식 Upbit SDK를 통한 인증 없는
-KRW 마켓 카탈로그 조회, SDK 응답과 내부 `TradingPair` 모델의 분리, CLI, 단위 테스트 4개,
-GitHub Actions의 기본 품질 검사다. canonical 1분봉, 파생 4시간봉, PIT 유니버스, 특징,
+현재 저장소에는 Python 3.12와 `uv` 기반 패키지, 공식 Upbit SDK의 인증 없는 공개 시장 조회,
+append-only raw/canonical 1분봉과 bounded backfill evidence, point-in-time minute slot·4시간봉,
+catalog snapshot·eligibility, 30일 liquidity·top-N 평가와 fresh non-warning analysis universe
+전체의 resumable dataset bootstrap, Ruff·Pytest·GitHub Actions 품질 검사가 구현되어 있다. 특징,
 모델, 백테스트, 계좌·원장, 주문, paper/shadow/live는 아직 구현되지 않았다. 따라서 이후
 장들의 연구·운영 구성요소는 현재 기능 설명이 아니라 구현 후 충족해야 할 계약이다.
 클라우드/VPS의 24시간 이벤트 기반 실행도 현재 기능이 아니라 검증·승격을 거쳐야 할 목표
@@ -217,6 +218,12 @@ final 이후 정정도 삭제나 덮어쓰기가 아니라 새 `revision`으로 
   설정과 manifest에 명시한다.
 - execution candidate 중 최대 6개 보유를 목표로 하지만 signal·portfolio·execution과 상장 후
   90일·authoritative listing history 정책은 아직 구현되지 않았다.
+- analysis universe의 30일 minute dataset은 explicit resumable bootstrap으로 구축한다. 실행
+  시작의 `resume_as_of`에서 이미 43,200 slot이 resolved된 market은 네트워크 없이 건너뛰고,
+  incomplete market은 동일한 전체 bounded range를 순차 재실행한다. canonical과 successful
+  evidence만 checkpoint로 사용하며 top-N으로 수집 대상을 축소하지 않는다.
+- 자동 스케줄링, 일별 incremental refresh와 authoritative historical listing backfill은 아직
+  구현되지 않았다.
 - 최종 생존 종목 목록으로 과거를 필터링하지 않는다.
 - 상장폐지·유의·정지 종목과 실패한 데이터 구간을 역사에서 제거하지 않는다.
 - BTC·ETH를 포함한 fresh non-warning market 전체를 analysis universe에 유지한다. 향후 별도

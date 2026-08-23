@@ -30,6 +30,7 @@
 - [x] point-in-time snapshot freshness와 warning 기반 catalog eligibility gate
 - [x] 완전한 minute evidence 기반 trailing 30-day KRW quote-volume metric과 rank
 - [x] 완결된 point-in-time liquidity rank 기반 versioned top-N shortlist
+- [x] fresh non-warning analysis universe 전체의 resumable 30일 minute dataset bootstrap
 - [ ] authoritative 상장 이력·상장 후 90일을 결합한 최종 투자 후보 정책
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
@@ -97,6 +98,13 @@ uv run cassandra-trader liquidity-top-n \
   --maximum-snapshot-age-seconds 3600 \
   --top-n 100 \
   --database candles.db
+
+uv run cassandra-trader bootstrap-liquidity-dataset \
+  --quote-currency KRW \
+  --universe-as-of 2026-08-23T12:10:00Z \
+  --window-end 2026-08-23T12:00:00Z \
+  --maximum-snapshot-age-seconds 3600 \
+  --database candles.db
 ```
 
 point-in-time universe query는 `available_at <= as_of`인 complete 성공 snapshot만 사용합니다. catalog snapshot 계층은 당시 membership과 warning metadata를 보존하고, 별도 catalog eligibility 계층은 호출자가 명시한 maximum snapshot age와 warning 여부만 판정합니다. snapshot이 없거나 `as_of - observed_at`이 maximum age를 초과하면 전체 결과를 `UNRESOLVED`로 fail-closed하고, fresh snapshot의 warning market만 `EXCLUDED`합니다. `ELIGIBLE`은 최종 매수 대상이 아니라 후속 유동성 심사 전 후보입니다.
@@ -107,7 +115,9 @@ trailing liquidity는 fresh catalog eligibility를 통과한 non-warning KRW mar
 
 `liquidity-top-n`은 완결된 upstream liquidity ordinal rank에서 호출자가 명시한 N까지만 `SELECTED`로 만드는 versioned read-only policy입니다. 초기 운영 목표는 `top_n=100`이며 domain이나 application에 하드코딩하지 않고 CLI와 향후 실행 설정에서 명시적으로 전달합니다. 동률도 기존 market-code tie-break rank를 그대로 사용하며 N 밖 종목을 추가하지 않습니다. upstream liquidity가 하나라도 unresolved이면 모든 존재 후보를 `UNRESOLVED`로 두고 partial selection을 만들지 않습니다. top 100도 최종 투자 유니버스나 매수 신호가 아닙니다. 향후 execution candidate 중 기존 포트폴리오 정책에 따라 최대 6개만 실제 보유할 예정이지만 signal, portfolio, execution은 아직 구현되지 않았습니다.
 
-현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 상장 후 90일 정책과 authoritative 과거 상장·폐지 이력 backfill은 아직 구현되지 않았습니다. 30일 구간 데이터의 자동 backfill도 이번 조회 기능에 포함되지 않습니다.
+`bootstrap-liquidity-dataset`은 명시한 fresh point-in-time catalog의 non-warning analysis universe 전체에 정확한 UTC 30일·43,200분 범위를 순차 백필합니다. 실행 시작의 `resume_as_of`로 기존 `MinuteSlotSummary`를 확인해 모든 slot이 이미 resolved된 market은 API 호출 없이 `SKIPPED_COMPLETE`로 건너뜁니다. incomplete market은 작은 gap만 최적화하지 않고 동일한 전체 범위를 다시 조회하며 기존 canonical revision과 successful evidence를 checkpoint로 재사용합니다. 한 market의 최종 실패는 `FAILED`로 남기고 다음 market을 계속 처리합니다. 보수적 rate limit과 timeout·connection·HTTP 429·5xx 한정 retry를 적용하고 synthetic candle이나 forward-fill은 만들지 않습니다.
+
+현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 상장 후 90일 정책과 authoritative 과거 상장·폐지 이력 backfill은 아직 구현되지 않았습니다. bootstrap의 자동 스케줄링과 일별 incremental refresh도 아직 구현되지 않았으며 명령을 명시적으로 실행해야 합니다.
 
 여러 KRW 마켓의 동일한 UTC `[start, end)` 구간을 순차 백필:
 

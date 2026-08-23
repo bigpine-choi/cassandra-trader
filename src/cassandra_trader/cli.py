@@ -10,6 +10,12 @@ from pathlib import Path
 
 from cassandra_trader.adapters.upbit.public_stream import StreamLifecycleEvent
 from cassandra_trader.apps.four_hour_bars import derive_four_hour_bar
+from cassandra_trader.apps.liquidity_dataset_bootstrap import (
+    LiquidityDatasetBootstrapStatus,
+    bootstrap_liquidity_dataset,
+    bootstrap_market_payload,
+    bootstrap_summary_payload,
+)
 from cassandra_trader.apps.liquidity_top_n import evaluate_liquidity_top_n_as_of
 from cassandra_trader.apps.market_catalog import fetch_krw_trading_pairs
 from cassandra_trader.apps.market_data_runtime import (
@@ -313,6 +319,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="positive number of liquidity-ranked markets to shortlist",
     )
     liquidity_top_n.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    bootstrap_dataset = commands.add_parser(
+        "bootstrap-liquidity-dataset",
+        help="bootstrap the full fresh non-warning KRW analysis universe with resume support",
+    )
+    bootstrap_dataset.add_argument(
+        "--quote-currency",
+        type=_krw_quote_currency,
+        required=True,
+        help="quote currency (must be KRW)",
+    )
+    bootstrap_dataset.add_argument(
+        "--universe-as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC point-in-time catalog cutoff",
+    )
+    bootstrap_dataset.add_argument(
+        "--window-end",
+        type=_liquidity_window_end,
+        required=True,
+        help="exclusive UTC minute boundary for the 30-day window",
+    )
+    bootstrap_dataset.add_argument(
+        "--maximum-snapshot-age-seconds",
+        type=_positive_timedelta_seconds,
+        required=True,
+        help="positive maximum catalog snapshot age in seconds",
+    )
+    bootstrap_dataset.add_argument(
         "--database",
         type=Path,
         required=True,
@@ -807,6 +848,32 @@ async def _backfill_dataset(
     return 1 if result.summary.failed else 0
 
 
+async def _bootstrap_liquidity_dataset(
+    quote_currency: str,
+    universe_as_of: datetime,
+    window_end: datetime,
+    maximum_snapshot_age_seconds: int,
+    database: Path,
+) -> int:
+    result = await bootstrap_liquidity_dataset(
+        quote_currency,
+        universe_as_of,
+        window_end,
+        database,
+        timedelta(seconds=maximum_snapshot_age_seconds),
+    )
+
+    for market_result in result.markets:
+        print(json.dumps(bootstrap_market_payload(market_result), separators=(",", ":")))
+
+    print(json.dumps(bootstrap_summary_payload(result.summary), separators=(",", ":")))
+    if result.summary.status is LiquidityDatasetBootstrapStatus.UNRESOLVED:
+        return 2
+    if result.summary.status is LiquidityDatasetBootstrapStatus.PARTIAL_FAILURE:
+        return 1
+    return 0
+
+
 def _optional_utc_text(value: datetime | None) -> str:
     if value is None:
         return "None"
@@ -1057,6 +1124,30 @@ def main(argv: Sequence[str] | None = None) -> int | None:
             arguments.maximum_snapshot_age_seconds,
             arguments.top_n,
             arguments.database,
+        )
+
+    if arguments.command == "bootstrap-liquidity-dataset":
+        now = datetime.now(UTC)
+        if arguments.window_end > arguments.universe_as_of:
+            parser.error(
+                "bootstrap-liquidity-dataset: --window-end must not be after --universe-as-of"
+            )
+        if arguments.window_end > now:
+            parser.error(
+                "bootstrap-liquidity-dataset: --window-end must not be after execution time"
+            )
+        if arguments.universe_as_of > now:
+            parser.error(
+                "bootstrap-liquidity-dataset: --universe-as-of must not be after execution time"
+            )
+        return asyncio.run(
+            _bootstrap_liquidity_dataset(
+                arguments.quote_currency,
+                arguments.universe_as_of,
+                arguments.window_end,
+                arguments.maximum_snapshot_age_seconds,
+                arguments.database,
+            )
         )
 
     if arguments.command == "candles":
