@@ -2,7 +2,7 @@
 
 업비트 KRW 현물시장을 대상으로 하는 Long/Cash 기반 알고리즘 자동매매 시스템입니다.
 
-현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, canonical 1분봉과 완결 4시간봉을 조회하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
+현재 버전은 API 키 없이 업비트 공개 시장 데이터를 수집해 SQLite에 보존하고, point-in-time 마켓 목록·canonical 1분봉·완결 4시간봉을 조회하는 읽기 전용 개발 단계입니다. 실제 주문은 실행하지 않습니다.
 
 ## 프로젝트 목표
 
@@ -26,7 +26,8 @@
 - [x] bounded backfill 실행 증거와 point-in-time 1분 slot 상태 판정
 - [x] point-in-time resolved minute slot 기반 UTC 4시간봉 파생
 - [x] 공개 WebSocket ticker·1분봉 수신, 재연결과 REST reconciliation
-- [ ] point-in-time 투자 유니버스
+- [x] append-only complete snapshot 기반 point-in-time 마켓 유니버스
+- [ ] warning·freshness·유동성을 결합한 투자 적격성 정책
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
 - [ ] 주문·체결·대사 시스템
@@ -64,6 +65,18 @@ uv run cassandra-trader markets --limit 10
 ```
 
 이 명령은 인증이 필요 없는 읽기 전용 공개 API만 사용하며 주문을 생성하지 않습니다.
+
+현재 KRW 마켓 catalog를 append-only snapshot으로 저장하고 과거 시점 기준으로 조회:
+
+```bash
+uv run cassandra-trader capture-universe --database candles.db
+
+uv run cassandra-trader universe-as-of \
+  --as-of 2026-08-23T12:00:00Z \
+  --database candles.db
+```
+
+point-in-time query는 `available_at <= as_of`인 complete 성공 snapshot만 사용합니다. 현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않으며 최초 성공 snapshot 이전은 `UNRESOLVED`입니다. snapshot은 raw warning metadata와 함께 append-only로 보존됩니다. warning 제외 및 freshness threshold는 후속 eligibility 정책이고, 공지사항 등 authoritative source를 이용한 과거 상장·폐지 이력 backfill은 아직 구현되지 않았습니다.
 
 여러 KRW 마켓의 동일한 UTC `[start, end)` 구간을 순차 백필:
 

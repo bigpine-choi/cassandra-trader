@@ -15,6 +15,10 @@ from cassandra_trader.apps.market_data_runtime import (
     RuntimeRecoveryEvent,
     run_market_data,
 )
+from cassandra_trader.apps.market_universe import (
+    capture_krw_market_catalog,
+    resolve_market_universe_as_of,
+)
 from cassandra_trader.apps.minute_candle_backfill import backfill_minute_candles
 from cassandra_trader.apps.minute_candles import (
     fetch_recent_minute_candles,
@@ -28,6 +32,7 @@ from cassandra_trader.apps.multi_market_dataset import (
 )
 from cassandra_trader.apps.public_stream import stream_public_events
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
+from cassandra_trader.domain.market import MarketUniverseStatus, normalize_quote_currency
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
 
 
@@ -83,6 +88,13 @@ def _krw_market_code(value: str) -> str:
     return normalized
 
 
+def _quote_currency(value: str) -> str:
+    try:
+        return normalize_quote_currency(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _utc_datetime(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -129,6 +141,40 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_positive_integer,
         default=10,
         help="maximum number of pairs to display",
+    )
+
+    capture_universe = commands.add_parser(
+        "capture-universe",
+        help="capture the current Upbit KRW market catalog in SQLite",
+    )
+    capture_universe.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
+    )
+
+    universe_as_of = commands.add_parser(
+        "universe-as-of",
+        help="resolve a stored point-in-time market universe without network access",
+    )
+    universe_as_of.add_argument(
+        "--quote-currency",
+        type=_quote_currency,
+        default="KRW",
+        help="ASCII quote currency (default: KRW)",
+    )
+    universe_as_of.add_argument(
+        "--as-of",
+        type=_utc_datetime,
+        required=True,
+        help="UTC information cutoff in ISO 8601 format",
+    )
+    universe_as_of.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path",
     )
 
     candles = commands.add_parser(
@@ -314,6 +360,71 @@ async def _print_markets(limit: int) -> None:
     for pair in pairs[:limit]:
         warning = " [WARNING]" if pair.is_warning else ""
         print(f"{pair.code:<12} {pair.korean_name}{warning}")
+
+
+async def _capture_universe(database: Path) -> int:
+    try:
+        result = await capture_krw_market_catalog(database)
+    except Exception as error:
+        payload = {
+            "type": "snapshot",
+            "status": "FAILED",
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+        }
+        print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
+        return 1
+
+    payload = {
+        "type": "snapshot",
+        "status": "SUCCEEDED",
+        "snapshot_id": result.snapshot_id,
+        "quote_currency": result.quote_currency,
+        "observed_at": _optional_utc_text(result.observed_at),
+        "available_at": _optional_utc_text(result.available_at),
+        "market_count": result.market_count,
+        "content_hash": result.content_hash,
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _print_universe_as_of(
+    quote_currency: str,
+    as_of: datetime,
+    database: Path,
+) -> int:
+    result = resolve_market_universe_as_of(quote_currency, as_of, database)
+
+    for pair in result.pairs:
+        payload = {
+            "type": "market",
+            "market": pair.code,
+            "korean_name": pair.korean_name,
+            "english_name": pair.english_name,
+            "is_warning": pair.is_warning,
+        }
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    summary = {
+        "type": "summary",
+        "status": result.status.value,
+        "quote_currency": result.quote_currency,
+        "as_of": _optional_utc_text(result.as_of),
+        "snapshot_id": result.snapshot_id,
+        "observed_at": (
+            None if result.observed_at is None else _optional_utc_text(result.observed_at)
+        ),
+        "available_at": (
+            None if result.available_at is None else _optional_utc_text(result.available_at)
+        ),
+        "content_hash": result.content_hash,
+        "market_count": len(result.pairs),
+    }
+    print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    return 2 if result.status is MarketUniverseStatus.UNRESOLVED else 0
 
 
 async def _print_candles(market: str, count: int) -> None:
@@ -573,6 +684,16 @@ def main(argv: Sequence[str] | None = None) -> int | None:
 
     if arguments.command == "markets":
         asyncio.run(_print_markets(arguments.limit))
+
+    if arguments.command == "capture-universe":
+        return asyncio.run(_capture_universe(arguments.database))
+
+    if arguments.command == "universe-as-of":
+        return _print_universe_as_of(
+            arguments.quote_currency,
+            arguments.as_of,
+            arguments.database,
+        )
 
     if arguments.command == "candles":
         asyncio.run(_print_candles(arguments.market, arguments.count))

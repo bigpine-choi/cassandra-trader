@@ -186,7 +186,7 @@ def test_stores_first_raw_and_canonical_batch(tmp_path: Path) -> None:
     assert result.new_canonical_count == 1
     assert result.revised_canonical_count == 0
     assert result.unchanged_canonical_count == 0
-    assert _count(database, "schema_migrations") == 2
+    assert _count(database, "schema_migrations") == 3
     assert _count(database, "raw_ingestion_batches") == 1
     assert _count(database, "raw_minute_candles") == 1
     assert _count(database, "canonical_minute_candles") == 1
@@ -255,10 +255,10 @@ def test_reopening_database_does_not_repeat_migration(tmp_path: Path) -> None:
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
 
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
 
 
-def test_existing_v1_database_preserves_canonical_data_when_v2_is_applied(
+def test_existing_v1_database_preserves_canonical_data_when_v2_and_v3_are_applied(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "legacy.db"
@@ -276,7 +276,7 @@ def test_existing_v1_database_preserves_canonical_data_when_v2_is_applied(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert versions == [(1,), (2,)]
+    assert versions == [(1,), (2,), (3,)]
 
 
 def test_backfill_run_evidence_enforces_status_contract_and_is_append_only(
