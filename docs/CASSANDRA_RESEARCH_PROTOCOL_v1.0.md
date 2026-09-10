@@ -114,6 +114,42 @@ proper-score skill은 `baseline loss - candidate loss`로 정의해 클수록 �
 - **승격 가능**: 12장의 현재 단계 게이트를 모두 충족했다. 실제 승격은 별도 사람 승인을
   요구한다.
 
+### 2.4 가격 동인 연구 가설
+
+2026-09-10 로드맵 편입: 가격형성 메커니즘의 설명, 미래수익 예측, 비용 후 투자성과를 별개의 주장으로 검증한다.
+아래는 **미구현 연구 계획**이며 2.2의 가설·판정 기준을 구체화한다. 정상 판단은 완결
+4시간봉마다 갱신하고 주 예측 수평선은 7일로 유지한다.
+
+| ID | 검증할 가설과 비교 실험 | 연결 가설·필수 증거 |
+|---|---|---|
+| PD-H1 | 시장 대비 상대강도와 거래활동 변화가 이후 7일 종목선택에 기여한다. 단순 모멘텀과 모멘텀+거래활동을 비교한다. | H-RANK·H-NET·H-ROBUST: 동일 PIT 유니버스·분할에서 순위 예측의 증분과 비용 후 경제효과를 각각 평가한다. 상대적 우위만으로 cash 대비 양의 수익을 가정하지 않는다. |
+| PD-H2 | 시장 추세·breadth·변동성·상관관계가 총노출 조절에 유용하다. 종목선택을 고정하고 고정 노출과 시장 상태별 노출을 비교한다. | H-DOWN·H-NET·H-ROBUST: cash 절대 hurdle 및 Calmar 적격 위험 기준선 대비 성과·하방위험을 평가하고 종목선택과 시장 노출의 기여를 분리한다. |
+| PD-H3 | 호가·체결 관측이 비용·유동성 위험 추정을 개선한다. 단순 비용 proxy와 microstructure 기반 추정을 비교한다. | H-DOWN·H-NET·H-ROBUST: OOS 비용오차·위험 calibration과 포트폴리오 영향을 평가한다. 단기 동시적 가격충격은 7일 알파의 증거가 아니며, 7일 예측 주장은 별도 H-RANK 실험으로 등록한다. |
+| PD-H4 | 외부 가격 동인이 기본 모델에 추가 정보를 제공한다. 거시·파생·온체인/공급·뉴스/사건·지역 가격괴리를 각각 후속 Challenger로 평가한다. | H-RANK 또는 H-DOWN과 H-NET·H-ROBUST: 동일 기본 모델에 변수군 하나씩 추가하고 군 내 데이터 출처도 하나씩 도입해 PIT·가용시각과 증분 성과를 검증한다. |
+
+1. 연구용 dataset/manifest·실행 가능한 label·시간순 split·experiment registry를 먼저
+   구현한다. 현재 30일 유동성 bootstrap의 완료를 7일 알파의 충분한 연구 이력으로 간주하지
+   않으며 학습 길이·유효 표본량은 `TBD-V01`로 정한다.
+2. 가격·거래량의 단순 기준선으로 PD-H1을 시작하고 PD-H2의 종목선택/총노출 분리 실험을
+   수행한다. 모델 계층은 5장, 순위·확률 보정과 C′ 연결은 8장을 따른다.
+3. 저장된 microstructure의 품질·단절 증거를 보존하는 조회·재생 API를 먼저 구현한 뒤
+   PD-H3의 특징·비용 추정을 추가한다. snapshot proxy, simulated/counterfactual TCA와
+   실제 fill 증거를 구분하며 수집 공백을 정상 이벤트로 합성하지 않는다.
+4. PD-H4는 3장의 데이터 계약을 통과한 출처만 연구 입력으로 추가한다. 해외 파생시장
+   자료는 read-only Challenger 정보이며 Binance 등 해외 거래소의 주문·선물 운용을
+   허용하는 범위 변경이 아니다. 1.3의 LLM 주문 경로 제외도 유지한다. 외부 동인 연구는
+   선택적 확장이며 기본 모델의 C′ 연결을 위한 선행 필수조건이 아니다.
+5. 모든 실험을 10장의 registry에 사전 등록하고 6장의 전역 시간순 split, label purging,
+   nested selection과 lockbox를 적용한다. 여러 변수군·출처를 비교한 시행을 누락하지 않으며
+   이미 열람한 OOS에 맞춰 새 후보를 만든 뒤 같은 결과를 독립 OOS로 재사용하지 않는다.
+
+label·분할·비용·경제효과·다중비교·배분 수치는 13장의 해당 TBD 확정 시점을 따른다.
+RD2~RD4의 초기 경제효과는 사전 고정한 단순 연구용 배분·비용 기준선으로 비교하며,
+최종 C′·노출·비용 결합 성과는 RD5에서 새 candidate에 맞춰 다시 검증한다.
+채택은 증분 성과·안정성·운영 가능성으로 판정하고 11~12장의 승격 게이트를 생략하지 않는다.
+기존 C′ 구조와 `EffectiveExposure` 역할을 유지하며 비용 구성요소는 7~8장의 배타적
+회계에 따라 한 번만 반영한다. 논문 결과나 Challenger 우승이 자동 승격을 뜻하지 않는다.
+
 ---
 
 ## 3. 데이터 및 시점 계약
@@ -285,6 +321,18 @@ availability model version을 manifest로 남긴다.
 특징 채택에는 단독 성과가 아니라 ablation, fold 안정성, 레짐·유동성 하위표본, 비용 후
 증분, drift 관측 가능성, 계산 지연과 lineage를 요구한다. 특징 수가 늘면 후보 시행 수와
 multiple-testing 부담도 함께 늘어난다.
+
+PD-H1~PD-H4의 특징을 구현할 때는 다음 의미·시점 계약을 추가로 적용한다. 아래 지표는
+후보이며 고정 방향의 매수·매도 규칙이나 현재 구현 기능을 뜻하지 않는다.
+
+| 동인 | 특징 해석과 구현 계약 |
+|---|---|
+| 주문흐름·호가 | 공격적 매수/매도 체결대금의 flow, 대기 호가잔량의 stock, 호가 변화 기반 OFI를 구분한다. 성긴 snapshot의 OFI는 관측 사이 주문·취소를 놓치는 proxy로 표시하고 완전한 event OFI로 주장하지 않는다. 거래대금 증가는 신규 자금 순유입의 증거가 아니다. |
+| 거시·위험선호 | 시장 공통요인과 발표 직후 surprise의 효과를 빈도·레짐별로 분리한다. 사후 개정 거시값·확정 자금흐름은 당시 이용 가능한 값으로 소급하지 않는다. |
+| 레버리지·청산 | OI 증가는 net long 증가가 아니다. 계약 수량·기초자산 수량·USD 명목금액과 계약 규격을 보존하고 USD OI의 가격 평가효과를 포지션 수량 변화와 분리한다. 청산 데이터의 거래소 범위·누락을 기록한다. |
+| 펀딩·베이시스 | 만기부 선물 베이시스, 무기한선물의 예상 펀딩, 확정·지급 펀딩을 별도 필드로 둔다. 예측값의 revision과 실제 가용시각을 보존하며 나중에 확정된 펀딩을 과거 예측 입력으로 사용하지 않는다. 높은 펀딩에 고정 하락 방향을 부여하지 않는다. |
+| 네트워크·공급·사건 | 이용량·수수료·발행·소각·언락·장애 등의 효용과 토큰 가치 귀속을 구분한다. 사전에 알려진 일정/예상과 이후 실제 변화·surprise를 분리하고, 예상의 출처·시점을 입증할 수 없으면 surprise라고 부르지 않는다. |
+| 시장 분절 | 국내외 가격괴리는 동일 자산·동일 시점의 가격, KRW/USD 환율과 스테이블코인/USD 가치를 보정한다. quote별 실제 가용시각·staleness와 이전 제약을 기록하며 가격괴리를 실행 가능한 무위험 차익으로 해석하지 않는다. |
 
 ---
 
@@ -825,6 +873,10 @@ WebSocket 이벤트만을 계좌의 최종 진실로 간주하지 않는다.
 | Makarov & Schoar (2020), [Trading and Arbitrage in Cryptocurrency Markets](https://doi.org/10.1016/j.jfineco.2019.07.001), *Journal of Financial Economics* | 동료심사 저널 | 거래소 분절, order flow와 price impact는 arrival/fill, spread/depth와 상태의존 비용을 직접 검증해야 할 근거다. 알파 수익성 증거는 아니다. |
 | Brauneis et al. (2021), [How to measure the liquidity of cryptocurrency markets?](https://doi.org/10.1016/j.jbankfin.2020.106041), *Journal of Banking & Finance* | 동료심사 저널 | candle 유동성 proxy 하나를 실행가능성으로 간주하지 않고 실제 spread·depth·impact와 대조한다. BTC/ETH 중심 결과의 전 종목 일반화를 금지한다. |
 | Han, Kang & Ryu (2026-03-26 revision), [Momentum in the Cryptocurrency Market: A Comprehensive Analysis under Realistic Assumptions](https://doi.org/10.2139/ssrn.4675565), SSRN working paper | **Preprint/working paper, 비동료심사** | 비용·일중경로·fat tail을 고려한 반례와 민감도 참고자료다. 단독 채택 근거가 아니며 정식 게재 여부와 revision을 추적한다. |
+| Cont, Kukanov & Stoikov (2014), [The Price Impact of Order Book Events](https://doi.org/10.1093/jjfinec/nbt003), *Journal of Financial Econometrics* | 동료심사 저널; [저자 공개본](https://arxiv.org/abs/1011.6402), 2011-04-13 revision | 미국 주식의 단기 OFI·가격충격·depth 관계는 PD-H3의 비용·위험 후보 근거다. 코인의 미래 7일 수익이나 비용 후 수익성 증거로 이전하지 않는다. |
+| Che et al. (2023-08), [The Crypto Cycle and US Monetary Policy](https://www.imf.org/-/media/Files/Publications/WP/2023/English/wpiea2023163-print-pdf.ashx), IMF WP/23/163 | **Working paper, 인용본은 비동료심사** | 공통요인과 위험감수 경로는 PD-H2·PD-H4의 상태변수 후보 근거다. 가격 공통요인의 설명력을 미래수익 예측 정확도로 해석하지 않는다. |
+| Benigno & Rosa (2023-02), [The Bitcoin–Macro Disconnect](https://www.newyorkfed.org/research/staff_reports/sr1052), NY Fed Staff Report 1052 | **Staff report, 인용본은 비동료심사** | 일중 발표 충격 연구의 제한된 반응은 거시변수에 고정 거래 방향을 부여하지 않을 근거다. Che et al.의 일별 연구와 빈도·식별·표본 차이를 구분한다. |
+| Schmeling, Schrimpf & Todorov (2025-10-08), [Crypto Carry](https://cepr.org/publications/dp20719), CEPR DP20719 | **Discussion paper, 인용본은 비동료심사** | 레버리지 수요와 차익거래 자본 제약은 PD-H4의 혼잡·위험 후보 근거다. 선물-현물 carry를 무기한선물 펀딩과 동일시하거나 높은 carry를 즉시 하락 신호로 바꾸지 않는다. |
 
 ### 14.2 금융 ML 검증·과최적화·불확실성
 
