@@ -6,6 +6,7 @@
 |---|---|
 | 문서 상태 | 구현 기준선(Baseline) |
 | 기준일 | 2026-08-22 |
+| 로드맵 갱신 | 2026-09-10 · 가격 동인 연구·구현 계획 편입 |
 | 대상 버전 | Cassandra v1.0 |
 | 개발 환경 | OMEN 노트북 · Windows/WSL2 Ubuntu · VS Code |
 | 운영 환경 | 서울 리전 Linux VPS · 24/7 |
@@ -708,6 +709,8 @@ Upbit에 완전한 공개 샌드박스가 없다는 전제에서 recorded replay
 
 ## 15. 구현 로드맵과 완료 기준
 
+### 15.1 전체 개발 단계
+
 | 단계 | 핵심 작업 | 주요 산출물 | 완료 기준 |
 |---|---|---|---|
 | Sprint 0 기반 | WSL2, VS Code, Git/GitHub, Python 환경, 비공개 저장소, CI, ADR | 설치 가능한 골격, lockfile, 설정 스키마, 테스트·보안 체크 | 로컬·CI의 동일 명령 성공, 비밀키 0건, 모드 분리 |
@@ -721,6 +724,67 @@ Upbit에 완전한 공개 샌드박스가 없다는 전제에서 recorded replay
 | Sprint 5 24/7 shadow | 클라우드 배포, 실시간 신호·가상주문, 예상·실현 비용 비교 | heartbeat, Telegram, email, 비용 보정 | 24시간 인수시험 + 권장 1주 soak, 미해결 P1 0건 |
 | Sprint 6 micro live | 소액 실주문, 운영키/IP, kill switch, rollback | live 어댑터, 런북, 실체결 보고 | 중복·미대사 0, 비용 허용범위, 복구·비상시험 통과 |
 | Live NAV 적응 | 실제 계좌 NAV 자동 반영, 유동성에 따른 분할 | 규모별 실행 보고 | 별도 자본 승인 변수 없이 안전 한도·대사 유지 |
+
+### 15.2 가격 동인 연구의 구현 순서
+
+2026-09-10 합의한 가격 동인 연구를 Sprint 2·3의 세부 로드맵으로 편입한다.
+아래 항목은 모두 계획이며 구현 완료나 수익성 입증을 뜻하지 않는다. 기존 데이터 수집·품질·
+상장 이력 과제를 선행조건으로 유지하고, 주 예측수평선 7일·완결 4시간봉 정상 판단·
+Upbit KRW Long/Cash·LLM 주문 경로 제외 정책을 따른다.
+
+| ID | 단계·의존성 | 구현 산출물 | 완료 기준 |
+|---|---|---|---|
+| RD1 | 연구 데이터 계약 · 기존 봉·유니버스·상장 이력 기반 | 공통 `bar_end/as_of` snapshot, availability 등급, revision·품질·lineage, 실행 가능한 7일 primary 및 1·3·14일 보조 label, manifest·registry·시간순 검증 골격 | 동일 입력·cutoff의 재현성, 미래정보·생존편향 검사, label 가용시각 및 불완전 자료 격리; 관련 Protocol TBD를 평가 전에 확정 |
+| RD2 | 기본 알파 연구 · RD1 | 다중기간 모멘텀·단기반전·거래활동 변화·변동성·시장 폭·BTC/ETH 상태; 단순 기준선과 Elastic Net·LightGBM/LambdaRank 비교 | 전역 시간축 OOS·purging/embargo·비용 및 2배 스트레스, 변수군 제거 비교, 기존 예측·경제효과·안정성 기준으로 판정; 임의 고정 가중치를 검증된 신호로 취급하지 않음 |
+| RD3 | 체결·호가 연구 · 기록 조회 계약, 비교 평가는 RD1·RD2 | microstructure query/replay, 관측구간·단절·중복 정책, 체결 불균형·스프레드·깊이·호가 변화 집계, 상태의존 비용·위험 추정 | 원본 증거를 보존한 결정론적 집계, 비용·위험 기준선 대비 OOS 증분; 짧은 관측 신호의 7일 알파 효과는 별도 검증 |
+| RD4 | 외부 동인 Challenger · RD1과 동결된 기본 비교 모델 | 거시·파생시장·네트워크·공급·뉴스·국내외 괴리용 read-only adapter와 publication/received/revision 계약, 변수군별 비교 실험 | 외부 입력의 PIT 근거와 비용·복잡도 대비 증분 확인; 자료 부족·효과 불명확·채택 실패를 구분해 기록 |
+| RD5 | 배분·운영 연결 · RD1~RD3의 채택 가능한 예측·위험·비용 | 보정된 기대수익·불확실성, 총노출·현금 판단, 강건 C′ 및 기존 공통 paper/shadow 경로 | 비용 배타적 매핑, 전체 계좌 비중 전환·제약·현금 처리, 재생·실시간 일치성, 기존 연구 및 운영 승격 게이트 통과 |
+
+RD2~RD4의 초기 경제성과는 사전 고정한 단순 연구용 배분·비용 기준선으로 평가한다.
+최종 C′·노출·비용 모형의 결합 성과는 RD5에서 다시 검증하며, 초기 기준선의 결과를
+최종 전략의 성과로 이전하지 않는다.
+
+RD3의 조회·재생 기반과 RD4의 원본 축적은 RD1·RD2와 병행할 수 있지만 결과 비교에는
+동일한 시점 계약과 검증 골격을 사용한다. RD4는 후속 Challenger이므로 모든 외부 자료가
+확보되거나 채택될 때까지 RD5를 중단하지 않는다. 외부 변수를 추가해 전략이 바뀌면 새
+candidate와 미열람 평가 구간으로 검증한다. 미시구조 수집은 실제 계좌·주문을 사용하지 않는
+현재 bounded recorder에서 시작하며, 24/7 수집·retention은 별도 관측·운영 과제다.
+
+30일 liquidity bootstrap은 유동성 판정용 자료 구축이다. 7일 알파의 충분한 독립 표본이나
+장기 백테스트용 당시 유니버스를 확보했다는 의미가 아니다. 과거 backfill의 실제 수신·가용
+시각을 소급하지 않으며, reconstructed PIT는 Protocol 3.1의 명시적 availability model과
+당시 revision 또는 원천 불변성 근거를 요구한다. 미입증 자료는 탐색용으로만 쓴다.
+
+### 15.3 가격 동인과 엔진의 연결
+
+| 동인 | 후보 특징 | 우선 역할 |
+|---|---|---|
+| 상대강도·관심 확산 | 모멘텀, 거래활동 변화, 시장 대비 잔차수익 | 종목별 기대수익·순위; 모멘텀의 인과 메커니즘이나 순수익을 사전 확정하지 않음 |
+| 시장 공통요인 | BTC/ETH, 시장 폭·변동성·상관관계; 거시는 RD4 | 총노출·시장위험; 상대적 강세와 현금 대비 양의 기대수익을 구분 |
+| 주문흐름·유동성 | 공격적 체결 불균형, 호가잔량·변화, 스프레드·깊이 | 비용·집행·단기 위험; snapshot 기반 OFI 근사와 완전한 사건 흐름을 구분 |
+| 레버리지 혼잡 | 펀딩·베이시스·미결제약정·청산 관측 | RD4 하방위험; OI 증가를 순매수, 양의 펀딩을 즉시 숏 신호로 간주하지 않음 |
+| 효용·공급·이벤트 | 네트워크 이용, 발행·소각·언락, 공개 사건 정보 | RD4 중장기 상태·이벤트 위험; 예정된 변화와 예상 밖 충격을 구분 |
+| 시장 분절 | 환율·스테이블코인 가치 보정 국내외 괴리 | RD4 지역 수급·상대가격 위험; 가격차를 즉시 실행 가능한 차익으로 간주하지 않음 |
+
+C′는 가격형성이나 알파 예측 공식이 아니라 예측·위험·비용을 받아 배분하는 목적함수다.
+순위 점수를 기대수익률로 직접 대입하지 않고 학습 내부 검증으로 수익률·확률을 보정하며
+불확실성을 반영한다. Protocol 8.1에 따라 같은 비용을 `net_edge`와 비용 항에서 중복
+차감하지 않는다. 외부 파생시장 자료는 현물 전략의 연구 입력이며, 선물·숏 실거래 전환은
+계약·증거금·펀딩·청산·포지션 회계와 시장 범위 변경을 별도로 다루어야 한다.
+
+### 15.4 기존 코드의 확장 위치
+
+다음 경로는 실제 패키지 `src/cassandra_trader/`를 기준으로 한다. 추가 경로는 구현 시
+확정할 제안이며 현재 존재하는 API나 CLI 명령으로 간주하지 않는다.
+
+| 기존 기반 | 추가 경로 제안 | 책임 |
+|---|---|---|
+| `apps/four_hour_bars.py`, `domain/four_hour_bar.py` | `features/price_volume.py` | 완결·무거래·불완전 상태를 보존한 가격·거래량 특징 |
+| 유니버스·적격성·유동성 서비스 | `features/market_state.py` | 당시 non-warning analysis universe 전체의 시장 폭·순위; top-N은 실행 후보에만 적용 |
+| 봉·유니버스·revision 저장소 | `domain/research_snapshot.py`, `apps/research_dataset.py` | 공통 cutoff, availability 등급, lineage·manifest |
+| `domain/microstructure.py`, recorder·SQLite 저장 | 저장소 query/replay 계약, `features/microstructure.py` | 현재 기록 경로에 없는 연구 조회·재생과 품질보존 집계 |
+| 신규 연구 계층 | `research/labels.py`, `research/walk_forward.py`, `research/registry.py` | 실행 가능한 label, 시간순 분할·학습 cutoff, 실패를 포함한 전체 실험 이력 |
+| 신규 모델·배분 계층 | `models/alpha.py`, `portfolio/allocator.py` | 예측 보정·위험·비용 계약을 지키는 C′ 연결 |
 
 ---
 
@@ -831,7 +895,12 @@ canonical 1분봉 기반 시장 데이터 경로의 현재 진행 상태는 다�
 12. 완료: fresh non-warning analysis universe 전체의 resumable 30일 liquidity dataset bootstrap
 13. 완료: current catalog capture와 evidence complement 기반 rolling 30일 incremental run-once refresh
 14. 완료: 고정된 point-in-time liquidity top-N 공개 trade·orderbook bounded append-only recorder
-15. 이후 로드맵: live smoke로 events/sec·SQLite MB/min을 측정한 뒤 장기 보존 정책을 정하고, authoritative 상장 이력·상장 후 90일 심사와 백테스트에 필요한 재현 가능한 데이터셋 확장
+15. 다음 데이터 과제: live smoke로 events/sec·SQLite MB/min을 측정해 장기 보존 정책을 정하고, authoritative 상장 이력·상장 후 90일 심사에 필요한 증거와 정책 확정
+16. RD1: 공통 cutoff·availability 등급·lineage를 갖는 연구 데이터셋과 실행 가능한 label·시간순 검증 골격
+17. RD2: 가격·거래량·시장 상태의 단순 기준선 및 Elastic Net·LightGBM 증분 비교
+18. RD3: 체결·호가 query/replay와 비용·위험 특징; 7일 알파 기여는 별도 실험
+19. RD4: 시점 계약을 갖춘 거시·파생시장·네트워크·공급·뉴스·국내외 괴리 Challenger를 변수군별로 연구
+20. RD5: 검증된 예측·위험·비용을 총노출·C′ 및 기존 paper/shadow 게이트에 연결
 
 이 top-N은 상장 이력 심사 전 liquidity shortlist다. 데이터·감시 기반이 재시작 이어받기와 결정론적 재생 기준을 통과한 뒤 authoritative listing history와 상장 후 90일 심사, 백테스트로 확장한다. 계좌 조회, 원장, paper/live 주문 경로는 해당 데이터 기반과 이후 안전 계약이 준비되기 전에는 구현 범위에 넣지 않는다.
 
