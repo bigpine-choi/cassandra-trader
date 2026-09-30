@@ -33,11 +33,33 @@
 - [x] fresh non-warning analysis universe 전체의 resumable 30일 minute dataset bootstrap
 - [x] current catalog capture와 successful evidence complement 기반 incremental run-once refresh
 - [x] 고정된 point-in-time liquidity top-N의 bounded 공개 trade·orderbook append-only recorder
+- [x] 읽기 전용 연구 데이터 준비상태 진단과 공통 cutoff의 탐색용 4시간봉 데이터셋 내보내기
 - [ ] authoritative 상장 이력·상장 후 90일을 결합한 최종 투자 후보 정책
 - [ ] 백테스트 및 페이퍼 트레이딩
 - [ ] 포트폴리오·리스크 엔진
 - [ ] 주문·체결·대사 시스템
 - [ ] 실거래 운영
+
+## 다음 개발 로드맵
+
+2026-09-10 가격 동인 연구 계획을 개발 로드맵에 편입했습니다. 아래 항목은 구현 예정이며,
+현재 읽기 전용 수집 기능과 구분합니다. 기존 데이터 품질·상장 이력 과제를 먼저 충족한 뒤
+완결 4시간봉과 향후 7일 주 예측수평선을 기준으로 진행합니다.
+
+1. **RD1 연구 데이터 계약:** 당시 유니버스·정보 가용시각·revision을 보존한 snapshot,
+   실행 가능한 label, dataset manifest와 시간순 검증 골격을 만듭니다.
+2. **RD2 기본 알파:** 가격·거래량·시장 상태의 단순 기준선부터 검증하고,
+   Elastic Net·LightGBM/LambdaRank의 증분 가치를 비교합니다.
+3. **RD3 미시구조:** 체결·호가 조회·재생 API를 추가하고 비용·유동성·하방위험을 검증합니다.
+4. **RD4 외부 동인 Challenger:** 거시·파생시장·네트워크·공급·뉴스·국내외 괴리를
+   시점 계약 확보 후 변수군별로 시험합니다. 기본 모델의 진행을 막는 필수 입력은 아닙니다.
+5. **RD5 배분·운영 연결:** 검증된 기대수익·위험·비용을 총노출과 C′에 연결한 뒤
+   기존 paper → shadow → micro live 게이트를 따릅니다.
+
+가격 설명, 미래 예측, 비용 후 투자성과를 각각 검증합니다. 외부 파생시장 데이터 연구는
+선물·숏 실거래 전환을 의미하지 않으며, LLM은 실거래 주문 경로에 사용하지 않습니다.
+단계별 의존성과 완료 기준은 [Blueprint 15장](docs/CASSANDRA_BLUEPRINT_v1.0.md#15-구현-로드맵과-완료-기준),
+가설과 반증 기준은 [Research Protocol 2.4절](docs/CASSANDRA_RESEARCH_PROTOCOL_v1.0.md#24-가격-동인-연구-가설)을 따릅니다.
 
 ## 핵심 설계 원칙
 
@@ -130,7 +152,7 @@ Universe는 용도별로 세 계층을 구분합니다. catalog universe는 Upbi
 
 trailing liquidity는 fresh catalog eligibility를 통과한 non-warning KRW market마다 정확한 UTC `[window_end - 30 days, window_end)`의 43,200개 minute slot을 `as_of` 기준으로 요약합니다. 실제 `TRADED` canonical candle의 `quote_volume`만 합산하고 `NO_TRADE`는 합계에 기여하지 않습니다. 한 slot이라도 `UNRESOLVED`이면 해당 metric의 volume을 공개하지 않으며, 후보 하나라도 unresolved이면 전체 rank를 만들지 않습니다. synthetic candle, forward-fill과 partial-volume ranking은 하지 않습니다.
 
-`liquidity-top-n`은 완결된 upstream liquidity ordinal rank에서 호출자가 명시한 N까지만 `SELECTED`로 만드는 versioned read-only policy입니다. 초기 운영 목표는 `top_n=100`이며 domain이나 application에 하드코딩하지 않고 CLI와 향후 실행 설정에서 명시적으로 전달합니다. 동률도 기존 market-code tie-break rank를 그대로 사용하며 N 밖 종목을 추가하지 않습니다. upstream liquidity가 하나라도 unresolved이면 모든 존재 후보를 `UNRESOLVED`로 두고 partial selection을 만들지 않습니다. top 100도 최종 투자 유니버스나 매수 신호가 아닙니다. 향후 execution candidate 중 기존 포트폴리오 정책에 따라 최대 6개만 실제 보유할 예정이지만 signal, portfolio, execution은 아직 구현되지 않았습니다.
+`liquidity-top-n`은 완결된 upstream liquidity ordinal rank에서 호출자가 명시한 N까지만 `SELECTED`로 만드는 versioned read-only policy입니다. 초기 운영 목표는 `top_n=100`이며 domain이나 application에 하드코딩하지 않고 CLI와 향후 실행 설정에서 명시적으로 전달합니다. 동률도 기존 market-code tie-break rank를 그대로 사용하며 N 밖 종목을 추가하지 않습니다. upstream liquidity가 하나라도 unresolved이면 모든 존재 후보를 `UNRESOLVED`로 두고 partial selection을 만들지 않습니다. top 100도 최종 투자 유니버스나 매수 신호가 아닙니다. 향후 execution candidate 중 실제 보유 종목 수는 고정하지 않고 비용 차감 엣지·불확실성·유동성·포트폴리오 분산효과로 결정할 예정이지만 signal, portfolio, execution은 아직 구현되지 않았습니다.
 
 `bootstrap-liquidity-dataset`은 명시한 fresh point-in-time catalog의 non-warning analysis universe 전체에 정확한 UTC 30일·43,200분 범위를 순차 백필합니다. 실행 시작의 `resume_as_of`로 기존 `MinuteSlotSummary`를 확인해 모든 slot이 이미 resolved된 market은 API 호출 없이 `SKIPPED_COMPLETE`로 건너뜁니다. incomplete market은 작은 gap만 최적화하지 않고 동일한 전체 범위를 다시 조회하며 기존 canonical revision과 successful evidence를 checkpoint로 재사용합니다. 한 market의 최종 실패는 `FAILED`로 남기고 다음 market을 계속 처리합니다. 보수적 rate limit과 timeout·connection·HTTP 429·5xx 한정 retry를 적용하고 synthetic candle이나 forward-fill은 만들지 않습니다.
 
@@ -138,7 +160,7 @@ trailing liquidity는 fresh catalog eligibility를 통과한 non-warning KRW mar
 
 `record-microstructure`는 시작 전 `evaluate_liquidity_top_n_as_of()`를 한 번만 평가해 fresh·resolved execution shortlist를 세션 전체에 고정하고, 선택된 market만의 공개 realtime trade와 orderbook snapshot·realtime frame을 지정한 기간 동안 기록합니다. analysis universe 전체를 대상으로 확장하지 않으며, API key·계좌·주문·Private WebSocket을 사용하지 않습니다. raw frame과 exact Decimal 정규화 event를 동일 transaction에 append하고 재연결마다 새 ticket으로 같은 고정 selection을 재구독하지만, capture 시작 이전 history나 disconnect 구간을 REST·synthetic event로 복원하지 않고 orderbook 완전성을 추측하지 않습니다. 아직 24/7 recorder, retention, compression, cost model 또는 signal·portfolio·execution 연결은 아니며, 실제 live smoke 후 events/sec와 SQLite MB/min을 측정해 장기 보존 정책을 정해야 합니다.
 
-현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 상장 후 90일 정책, authoritative 과거 상장·폐지 이력 backfill과 별도 research dataset 파이프라인은 아직 구현되지 않았습니다. refresh 자동 scheduler도 없으므로 명령을 cron/systemd 없이 명시적으로 실행해야 하며 signal, portfolio, execution에는 연결되지 않습니다.
+현재 `/v1/market/all` 응답을 과거 상장 상태로 소급하지 않습니다. 최초 성공 snapshot 이전은 `UNRESOLVED`이며 current listing이나 candle history로 listing age를 합성하지 않습니다. 상장 후 90일 정책, authoritative 과거 상장·폐지 이력 backfill과 정식 학습·검증 파이프라인은 아직 구현되지 않았습니다. 탐색용 연구 데이터셋 추출은 아래의 읽기 전용 명령으로 제공합니다. refresh 자동 scheduler도 없으므로 명령을 cron/systemd 없이 명시적으로 실행해야 하며 signal, portfolio, execution에는 연결되지 않습니다.
 
 여러 KRW 마켓의 동일한 UTC `[start, end)` 구간을 순차 백필:
 
@@ -172,6 +194,42 @@ uv run cassandra-trader four-hour-bar \
   --database candles.db
 ```
 
+## 연구 데이터 준비상태와 탐색용 데이터셋
+
+기존 SQLite DB에서 명시한 종목·기간을 읽습니다. API 호출, DB 생성·마이그레이션,
+추가 수집은 수행하지 않습니다. 실제 DB에 저장된 기간과 맞게 날짜를 지정해야 합니다.
+
+```bash
+uv run cassandra-trader research-readiness KRW-BTC KRW-ETH \
+  --start 2026-08-24T00:00:00Z --end 2026-08-25T00:00:00Z \
+  --as-of 2026-08-25T00:10:00Z \
+  --maximum-snapshot-age-seconds 3600 --database candles.db
+
+uv run cassandra-trader export-research-dataset KRW-BTC KRW-ETH \
+  --start 2026-08-24T00:00:00Z --end 2026-08-25T00:00:00Z \
+  --as-of 2026-08-25T00:10:00Z \
+  --maximum-snapshot-age-seconds 3600 --database candles.db \
+  --output artifacts/research/20260825-v1
+```
+
+- `research-readiness`: 종목별 거래·무거래·미확인 분 수, 누락 구간, 관측 범위,
+  마지막 가용시각, 4시간봉 완결 여부와 cutoff 시점 catalog 상태를 JSON으로 출력합니다.
+- `export-research-dataset`: `bars.jsonl`, `lineage.jsonl`, `readiness.json`,
+  `manifest.json`을 새 디렉터리에 저장합니다. 기존 출력은 덮어쓰지 않습니다.
+- 시작·종료는 UTC 4시간 경계, 범위는 `[start, end)`, `as_of >= end`여야 합니다.
+- 종료 코드: **0** 요청 종목의 구간 완결 및 catalog 적격, **2** 데이터 미완결 또는
+  catalog 미적격, **1** DB·파일·실행 오류. 잘못된 인자도 argparse 규칙에 따라 2입니다.
+  데이터나 catalog가 미완결이어도 진단용 export는 보존됩니다.
+- `data_complete`는 분 단위 증거가 모두 있다는 뜻이며, 무거래도 포함합니다.
+  가격 관측·학습 표본의 충분함 또는 매매 가능성을 의미하지 않습니다.
+- 명시한 종목만 진단합니다. 전체 analysis universe나 유동성 top-N의 준비 완료를
+  선언하거나 일부 종목만으로 유동성 순위를 생성하지 않습니다.
+- 모든 출력은 **`NON_PIT_EXPLORATORY`**, **`confirmatory_ready=false`**입니다.
+  공통 cutoff에서 알려진 과거 봉을 추출할 뿐 각 과거 의사결정 시점의 정보·상장 이력을
+  복원하지 않습니다. 완전한 데이터여도 정식 OOS·lockbox·모델 승격 근거로 쓰지 않습니다.
+
+구체적인 파일 계약과 제한은 [Research Dataset v1](docs/RESEARCH_DATASET_V1.md)을 참고합니다.
+
 ## 코드 품질 검사
 
 ```bash
@@ -196,4 +254,4 @@ git diff --check
 
 ## 주의사항
 
-현재 버전은 시장 데이터 조회 기능만 구현된 개발 버전입니다. 실제 주문, 자산 운용 또는 수익 창출 기능은 아직 구현되지 않았습니다.
+현재 버전은 시장 데이터 수집·조회와 탐색용 연구 데이터 추출 단계입니다. 실제 주문, 자산 운용 또는 수익 창출 기능은 아직 구현되지 않았습니다.

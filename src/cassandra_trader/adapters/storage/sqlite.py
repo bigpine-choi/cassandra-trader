@@ -667,6 +667,23 @@ class StoredMinuteCandle:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredMinuteCandleSourceProvenance:
+    """Immutable raw-record and ingestion-batch lineage for one canonical input."""
+
+    raw_record_id: int
+    batch_id: str
+    source: str
+    endpoint: str
+    request_parameters_json: str
+    received_at: datetime
+    ingested_at: datetime
+    response_order: int
+    market: str
+    source_candle_time: datetime
+    payload_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalMinuteCandleCoverage:
     """Logical canonical minute coverage for one half-open UTC range."""
 
@@ -815,17 +832,43 @@ class MicrostructureEventIngestionResult:
 class SqliteMinuteCandleRepository:
     """Persist raw observations and immutable canonical candle revisions."""
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, read_only: bool = False) -> None:
+        """Open a writer, or pin one consistent read-only snapshot until close.
+
+        Read-only access requires an existing, fully migrated database. It neither
+        creates directories nor migrates or changes the database's journal mode.
+        Open a new repository when a later committed snapshot is required.
+        """
+
+        if not isinstance(read_only, bool):
+            raise ValueError("read_only must be a boolean")
         self.database = Path(database).expanduser()
-        self.database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.database)
+        self._read_only = read_only
+        if read_only:
+            self._connection = sqlite3.connect(
+                self.database.resolve().as_uri() + "?mode=ro", uri=True
+            )
+        else:
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.database)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
+        try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            if read_only:
+                self._connection.execute("PRAGMA query_only = ON")
+                self._connection.execute("BEGIN")
+                # BEGIN alone is deferred; this read pins the database snapshot
+                # before any caller can read catalog, candle or evidence rows.
+                self._validate_read_only_schema()
+            else:
+                self._connection.execute("PRAGMA journal_mode = WAL")
+                self._migrate()
+        except BaseException:
+            self._connection.close()
+            raise
 
     def close(self) -> None:
-        """Close the SQLite connection."""
+        """Close the connection, releasing any pinned read transaction."""
 
         self._connection.close()
 
@@ -848,6 +891,7 @@ class SqliteMinuteCandleRepository:
     ) -> IngestionStats:
         """Atomically append a raw batch and any necessary canonical revisions."""
 
+        self._require_writable()
         effective_ingested_at = ingested_at or datetime.now(UTC)
         received_text = _utc_text(received_at)
         ingested_text = _utc_availability_text(effective_ingested_at)
@@ -1031,6 +1075,53 @@ class SqliteMinuteCandleRepository:
 
         return tuple(_stored_candle(row) for row in rows)
 
+    def get_minute_candle_source_provenance(
+        self,
+        source_raw_record_id: int,
+    ) -> StoredMinuteCandleSourceProvenance | None:
+        """Return source metadata within the same snapshot as canonical reads."""
+
+        if (
+            not isinstance(source_raw_record_id, int)
+            or isinstance(source_raw_record_id, bool)
+            or source_raw_record_id < 1
+        ):
+            raise ValueError("source_raw_record_id must be a positive integer")
+        records = self.list_minute_candle_source_provenance((source_raw_record_id,))
+        return records[0] if records else None
+
+    def list_minute_candle_source_provenance(
+        self,
+        raw_record_ids: tuple[int, ...],
+    ) -> tuple[StoredMinuteCandleSourceProvenance, ...]:
+        """Return unique existing source records in ID order, using bounded queries."""
+
+        if not isinstance(raw_record_ids, tuple) or any(
+            not isinstance(record_id, int) or isinstance(record_id, bool) or record_id < 1
+            for record_id in raw_record_ids
+        ):
+            raise ValueError("raw_record_ids must be a tuple of positive integers")
+        selected = tuple(sorted(set(raw_record_ids)))
+        records: list[StoredMinuteCandleSourceProvenance] = []
+        for offset in range(0, len(selected), 500):
+            chunk = selected[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._connection.execute(
+                f"""
+                SELECT raw.raw_record_id, raw.batch_id, raw.response_order, raw.market,
+                       raw.source_candle_time, raw.payload_sha256,
+                       batch.source, batch.endpoint, batch.request_parameters_json,
+                       batch.received_at, batch.ingested_at
+                FROM raw_minute_candles AS raw
+                JOIN raw_ingestion_batches AS batch ON batch.batch_id = raw.batch_id
+                WHERE raw.raw_record_id IN ({placeholders})
+                ORDER BY raw.raw_record_id
+                """,
+                chunk,
+            ).fetchall()
+            records.extend(_stored_source_provenance(row) for row in rows)
+        return tuple(records)
+
     def list_minute_candles_as_of(
         self,
         market: str,
@@ -1135,6 +1226,7 @@ class SqliteMinuteCandleRepository:
     ) -> None:
         """Append terminal evidence for one bounded minute-candle backfill."""
 
+        self._require_writable()
         if not run_id.strip():
             raise ValueError("run_id must not be empty")
 
@@ -1240,6 +1332,7 @@ class SqliteMinuteCandleRepository:
     ) -> StoredMarketCatalogSnapshot:
         """Atomically append one complete catalog snapshot or failed request evidence."""
 
+        self._require_writable()
         if not snapshot_id.strip():
             raise ValueError("snapshot_id must not be empty")
 
@@ -1449,6 +1542,7 @@ class SqliteMinuteCandleRepository:
     ) -> None:
         """Atomically append and seal one fixed top-N capture session header."""
 
+        self._require_writable()
         selected = tuple(markets)
         if not session.session_id.strip() or not session.source.strip():
             raise ValueError("session_id and source must not be empty")
@@ -1587,6 +1681,7 @@ class SqliteMinuteCandleRepository:
     ) -> None:
         """Append one connection lifecycle observation."""
 
+        self._require_writable()
         if (
             not isinstance(lifecycle_ordinal, int)
             or isinstance(lifecycle_ordinal, bool)
@@ -1639,6 +1734,7 @@ class SqliteMinuteCandleRepository:
     ) -> MicrostructureEventIngestionResult:
         """Atomically append one raw envelope and its normalized child rows."""
 
+        self._require_writable()
         if not event_id.strip():
             raise ValueError("event_id must not be empty")
         if (
@@ -1797,6 +1893,7 @@ class SqliteMinuteCandleRepository:
     ) -> None:
         """Append and validate one terminal session evidence row."""
 
+        self._require_writable()
         normalized_status = MicrostructureTerminalStatus(status)
         counts = (
             received_trade_count,
@@ -1845,6 +1942,24 @@ class SqliteMinuteCandleRepository:
                     error_type,
                     error_message,
                 ),
+            )
+
+    def _require_writable(self) -> None:
+        if self._read_only:
+            raise sqlite3.OperationalError("repository is read-only")
+
+    def _validate_read_only_schema(self) -> None:
+        try:
+            applied_versions = {
+                row["version"]
+                for row in self._connection.execute("SELECT version FROM schema_migrations")
+            }
+        except sqlite3.DatabaseError as error:
+            raise RuntimeError("read-only access requires a supported database schema") from error
+
+        if applied_versions != {version for version, _ in _MIGRATIONS}:
+            raise RuntimeError(
+                f"read-only access requires fully migrated schema version {_SCHEMA_VERSION}"
             )
 
     def _migrate(self) -> None:
@@ -1974,6 +2089,22 @@ def market_catalog_content_hash(
         "members": canonical_members,
     }
     return _sha256(_json_text(canonical_snapshot))
+
+
+def _stored_source_provenance(row: sqlite3.Row) -> StoredMinuteCandleSourceProvenance:
+    return StoredMinuteCandleSourceProvenance(
+        raw_record_id=row["raw_record_id"],
+        batch_id=row["batch_id"],
+        source=row["source"],
+        endpoint=row["endpoint"],
+        request_parameters_json=row["request_parameters_json"],
+        received_at=_parse_utc(row["received_at"]),
+        ingested_at=_parse_utc(row["ingested_at"]),
+        response_order=row["response_order"],
+        market=row["market"],
+        source_candle_time=_parse_utc(row["source_candle_time"]),
+        payload_sha256=row["payload_sha256"],
+    )
 
 
 def _stored_candle(row: sqlite3.Row) -> StoredMinuteCandle:

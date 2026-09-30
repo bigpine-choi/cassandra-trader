@@ -52,12 +52,17 @@ from cassandra_trader.apps.multi_market_dataset import (
     summary_payload,
 )
 from cassandra_trader.apps.public_stream import stream_public_events
+from cassandra_trader.apps.research_dataset import (
+    export_research_dataset,
+    inspect_research_dataset,
+)
 from cassandra_trader.domain.four_hour_bar import FourHourBarStatus
 from cassandra_trader.domain.liquidity_top_n import LiquidityTopNEvaluationStatus
 from cassandra_trader.domain.market import MarketUniverseStatus, normalize_quote_currency
 from cassandra_trader.domain.market_eligibility import MarketEligibilityEvaluationStatus
 from cassandra_trader.domain.market_liquidity import MarketLiquidityEvaluationStatus
 from cassandra_trader.domain.public_stream import MinuteCandleUpdate, PublicMarketEvent, TickerEvent
+from cassandra_trader.domain.research_dataset import ResearchDatasetRequest
 
 
 def _positive_integer(value: str) -> int:
@@ -200,6 +205,24 @@ def _liquidity_window_end(value: str) -> datetime:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cassandra-trader")
     commands = parser.add_subparsers(dest="command")
+
+    for command_name, help_text in (
+        ("research-readiness", "inspect stored research data without network or database writes"),
+        ("export-research-dataset", "export a reproducible exploratory four-hour dataset"),
+    ):
+        research = commands.add_parser(command_name, help=help_text)
+        # Validate original characters in the request before uppercasing can
+        # convert a non-ASCII name (for example sharp-s) into an ASCII code.
+        research.add_argument("markets", nargs="+")
+        research.add_argument("--start", required=True, type=_four_hour_start)
+        research.add_argument("--end", required=True, type=_four_hour_start)
+        research.add_argument("--as-of", required=True, type=_utc_datetime)
+        research.add_argument(
+            "--maximum-snapshot-age-seconds", required=True, type=_positive_timedelta_seconds
+        )
+        research.add_argument("--database", required=True, type=Path)
+        if command_name == "export-research-dataset":
+            research.add_argument("--output", required=True, type=Path)
 
     markets = commands.add_parser(
         "markets",
@@ -1248,6 +1271,41 @@ def main(argv: Sequence[str] | None = None) -> int | None:
     if arguments.command is None:
         print("Cassandra Trader")
         return
+
+    if arguments.command in ("research-readiness", "export-research-dataset"):
+        try:
+            request = ResearchDatasetRequest(
+                markets=tuple(arguments.markets),
+                start_time_utc=arguments.start,
+                end_time_utc=arguments.end,
+                as_of=arguments.as_of,
+                maximum_snapshot_age=timedelta(seconds=arguments.maximum_snapshot_age_seconds),
+            )
+        except ValueError as error:
+            parser.error(f"{arguments.command}: {error}")
+
+        try:
+            if arguments.command == "research-readiness":
+                result = inspect_research_dataset(request, arguments.database)
+            else:
+                result = export_research_dataset(request, arguments.database, arguments.output)
+        except Exception as error:
+            print(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "command": arguments.command,
+                        "error": {"type": type(error).__name__, "message": str(error)},
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
+            return 1
+
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        return 0 if result["data_complete"] and result["catalog_ready"] else 2
 
     if arguments.command == "markets":
         asyncio.run(_print_markets(arguments.limit))
